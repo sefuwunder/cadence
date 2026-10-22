@@ -1,0 +1,231 @@
+// Cadence API tests — bun test (single file; bun shares globalThis across files).
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { createApp } from "../src/server.ts";
+import { connectors } from "../src/connectors/index.ts";
+import { _test as imapTest } from "../src/connectors/email-imap.ts";
+import { keyIsValid } from "../src/connectors/webhook.ts";
+
+let app: ReturnType<typeof createApp>;
+let tmp: string;
+let seedPbId = "";
+let runId = "";
+let kpiId = "";
+let taskId = "";
+
+async function call(method: string, path: string, body?: any) {
+  const res = await app.fetch(
+    new Request(`http://localhost${path}`, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  );
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, data };
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+beforeAll(() => {
+  tmp = mkdtempSync(join(tmpdir(), "cadence-test-"));
+  app = createApp({ dbPath: join(tmp, "test.db") });
+});
+afterAll(() => {
+  app.close();
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+describe("seed + playbooks", () => {
+  test("seed playbook exists on fresh db", async () => {
+    const { status, data } = await call("GET", "/api/playbooks");
+    expect(status).toBe(200);
+    expect(data.length).toBe(1);
+    expect(data[0].name).toBe("30-Day Sprint — $60k & 20 SQLs");
+    seedPbId = data[0].id;
+  });
+
+  test("playbook CRUD", async () => {
+    const created = await call("POST", "/api/playbooks", {
+      name: "Test PB", description: "d",
+      weeks: { weeks: [{ theme: "W1", roles: { CEO: ["a"] } }], kpis: [] },
+    });
+    expect(created.status).toBe(201);
+    const id = created.data.id;
+    const got = await call("GET", `/api/playbooks/${id}`);
+    expect(got.status).toBe(200);
+    expect(got.data.weeks_json.weeks[0].theme).toBe("W1");
+    const upd = await call("PUT", `/api/playbooks/${id}`, { name: "Test PB2" });
+    expect(upd.status).toBe(200);
+    const del = await call("DELETE", `/api/playbooks/${id}`);
+    expect(del.status).toBe(200);
+    expect((await call("GET", `/api/playbooks/${id}`)).status).toBe(404);
+  });
+
+  test("playbook create requires name", async () => {
+    expect((await call("POST", "/api/playbooks", {})).status).toBe(400);
+  });
+});
+
+describe("runs + dashboard", () => {
+  test("create run instantiates tasks and kpis", async () => {
+    const { status, data } = await call("POST", "/api/runs", {
+      playbook_id: seedPbId, name: "Sprint 1", start_date: today(),
+    });
+    expect(status).toBe(201);
+    runId = data.id;
+    const dash = await call("GET", `/api/runs/${runId}`);
+    expect(dash.status).toBe(200);
+    expect(dash.data.weeks.length).toBe(4);
+    expect(dash.data.kpis.length).toBe(5);
+    expect(dash.data.overall.tasks_total).toBe(38);
+    expect(dash.data.overall.tasks_done).toBe(0);
+    expect(dash.data.overall.pct).toBe(0);
+    expect(dash.data.current_week).toBe(1);
+    // kpi names + targets from seed
+    const sqls = dash.data.kpis.find((k: any) => k.name === "SQLs");
+    expect(sqls.targets).toEqual([0, 10, 18, 20]);
+    kpiId = sqls.id;
+    taskId = dash.data.weeks[0].roles.CEO[0].id;
+  });
+
+  test("runs list shows progress", async () => {
+    const { data } = await call("GET", "/api/runs");
+    expect(data.length).toBe(1);
+    expect(data[0].pct).toBe(0);
+  });
+
+  test("task toggle flips done state", async () => {
+    const t1 = await call("POST", `/api/runs/${runId}/tasks/${taskId}/toggle`);
+    expect(t1.status).toBe(200);
+    expect(t1.data.done).toBe(true);
+    const dash = await call("GET", `/api/runs/${runId}`);
+    expect(dash.data.overall.tasks_done).toBe(1);
+    expect(dash.data.weeks[0].roles.CEO[0].done).toBe(true);
+    const t2 = await call("POST", `/api/runs/${runId}/tasks/${taskId}/toggle`);
+    expect(t2.data.done).toBe(false);
+  });
+
+  test("toggle unknown task 404s", async () => {
+    expect((await call("POST", `/api/runs/${runId}/tasks/nope/toggle`)).status).toBe(404);
+  });
+
+  test("metric entries feed dashboard math", async () => {
+    const e1 = await call("POST", `/api/kpis/${kpiId}/entries`, {
+      date: today(), value: 7, note: "week push",
+    });
+    expect(e1.status).toBe(201);
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const sqls = dash.data.kpis.find((k: any) => k.id === kpiId);
+    expect(sqls.actuals[0]).toBe(7);
+    expect(sqls.total_actual).toBe(7);
+    expect(sqls.recent[0].source).toBe("manual");
+    expect(dash.data.activity[0].type).toBe("metric");
+  });
+
+  test("entry validation", async () => {
+    expect((await call("POST", `/api/kpis/${kpiId}/entries`, { date: "bad", value: 1 })).status).toBe(400);
+    expect((await call("POST", `/api/kpis/${kpiId}/entries`, { date: today(), value: "x" })).status).toBe(400);
+    expect((await call("POST", `/api/kpis/nope/entries`, { date: today(), value: 1 })).status).toBe(404);
+  });
+
+  test("run update + delete cascade", async () => {
+    const upd = await call("PUT", `/api/runs/${runId}`, { status: "paused" });
+    expect(upd.status).toBe(200);
+    const del = await call("DELETE", `/api/runs/${runId}`);
+    expect(del.status).toBe(200);
+    expect((await call("GET", `/api/runs/${runId}`)).status).toBe(404);
+    // re-create for later suites
+    const r = await call("POST", "/api/runs", { playbook_id: seedPbId, start_date: today() });
+    runId = r.data.id;
+    const dash = await call("GET", `/api/runs/${runId}`);
+    kpiId = dash.data.kpis[0].id;
+  });
+});
+
+describe("connectors", () => {
+  test("registry lists the three built-ins", async () => {
+    const { status, data } = await call("GET", "/api/connectors");
+    expect(status).toBe(200);
+    expect(data.map((c: any) => c.id).sort()).toEqual(["email-imap", "manual", "webhook"]);
+    expect(connectors.size).toBe(3);
+  });
+
+  test("connector config save + read", async () => {
+    const save = await call("POST", "/api/connectors/manual", { config: { a: 1 } });
+    expect(save.status).toBe(200);
+    const got = await call("GET", "/api/connectors/manual");
+    expect(got.data.config).toEqual({ a: 1 });
+    const list = await call("GET", "/api/connectors");
+    expect(list.data.find((c: any) => c.id === "manual").configured).toBe(true);
+  });
+
+  test("unknown connector 404s", async () => {
+    expect((await call("GET", "/api/connectors/nope")).status).toBe(404);
+    expect((await call("POST", "/api/connectors/nope/sync", {})).status).toBe(404);
+  });
+
+  test("manual sync inserts nothing", async () => {
+    const r = await call("POST", "/api/connectors/manual/sync", {
+      kpi_id: kpiId, from: today(), to: today(),
+    });
+    expect(r.status).toBe(200);
+    expect(r.data.inserted).toBe(0);
+  });
+
+  test("sync validates input", async () => {
+    expect((await call("POST", "/api/connectors/manual/sync", { kpi_id: kpiId })).status).toBe(400);
+    expect((await call("POST", "/api/connectors/manual/sync",
+      { kpi_id: "nope", from: today(), to: today() })).status).toBe(404);
+  });
+});
+
+describe("webhook", () => {
+  const KEY = "test-key-123";
+  test("key validation helper", () => {
+    expect(keyIsValid({ keys: { [KEY]: { label: "x" } } }, KEY)).toBe(true);
+    expect(keyIsValid({ keys: {} }, KEY)).toBe(false);
+    expect(keyIsValid({}, KEY)).toBe(false);
+  });
+
+  test("hook writes entry with valid key", async () => {
+    await call("POST", "/api/connectors/webhook", { config: { keys: { [KEY]: { label: "t" } } } });
+    const r = await call("POST", `/api/hooks/${KEY}`, {
+      kpi_id: kpiId, date: today(), value: 3, note: "crm push",
+    });
+    expect(r.status).toBe(201);
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const k = dash.data.kpis.find((x: any) => x.id === kpiId);
+    expect(k.recent[0].source).toBe("webhook");
+    expect(k.recent[0].note).toBe("crm push");
+  });
+
+  test("hook rejects bad key and bad body", async () => {
+    expect((await call("POST", "/api/hooks/wrong", {
+      kpi_id: kpiId, date: today(), value: 1,
+    })).status).toBe(401);
+    expect((await call("POST", `/api/hooks/${KEY}`, { kpi_id: kpiId, date: "bad", value: 1 })).status).toBe(400);
+  });
+});
+
+describe("email-imap helpers", () => {
+  test("imapDate formats for SEARCH", () => {
+    expect(imapTest.imapDate("2026-10-22")).toBe("22-Oct-2026");
+    expect(() => imapTest.imapDate("nope")).toThrow();
+  });
+  test("internalDateToIso parses INTERNALDATE", () => {
+    expect(imapTest.internalDateToIso("22-Oct-2026 10:00:00 +0000")).toBe("2026-10-22");
+    expect(imapTest.internalDateToIso("5-Jan-2025 00:00:00 -0500")).toBe("2025-01-05");
+    expect(imapTest.internalDateToIso("garbage")).toBe("");
+  });
+  test("resolveConfig demands credentials", () => {
+    expect(() => imapTest.resolveConfig({})).toThrow(/missing IMAP credentials/);
+    const c = imapTest.resolveConfig({ host: "h", user: "u", pass: "p" });
+    expect(c.port).toBe(993);
+  });
+  test("sync without config fails with human message", async () => {
+    const conn = connectors.get("email-imap")!;
+    await expect(conn.sync({ from: today(), to: today(), config: {} })).rejects.toThrow(/missing IMAP credentials/);
+  });
+});
