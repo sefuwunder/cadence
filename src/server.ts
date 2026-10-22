@@ -9,6 +9,7 @@ import { initDb, seedIfEmpty } from "./db.ts";
 import { getConnector, connectors } from "./connectors/index.ts";
 import { keyIsValid } from "./connectors/webhook.ts";
 import { searchThreads } from "./connectors/email-imap.ts";
+import { listGoaMailAccounts } from "./goa.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -332,6 +333,20 @@ export function createApp(opts: { dbPath: string }) {
         return json([...connectors.values()].map((c) => ({
           id: c.id, name: c.name, description: c.description, configured: cfgs.has(c.id),
         })));
+      }
+      // GNOME Online Accounts mail accounts (for the email-imap setup).
+      // Never 500s when GOA is absent — availability is the answer.
+      pm = path.match(/^\/api\/connectors\/email-imap\/goa-accounts$/);
+      if (pm && m === "GET") {
+        try {
+          const accounts = await listGoaMailAccounts();
+          return json({
+            available: true,
+            accounts: accounts.map((a) => ({ id: a.id, email: a.email, provider: a.providerName })),
+          });
+        } catch {
+          return json({ available: false, accounts: [] });
+        }
       }
       // Email thread search (evidence linking). Before the generic :id block.
       pm = path.match(/^\/api\/connectors\/email-imap\/threads$/);

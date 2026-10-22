@@ -316,7 +316,8 @@ async function connSheet(id) {
       <div class="field"><label>Username</label><input id="f-user" value="${esc(cfg.user || "")}" autocomplete="off"></div>
       <div class="field"><label>Password / app password</label><input id="f-pass" type="password" value="${esc(cfg.pass || "")}" autocomplete="off"></div>
       <div class="field"><label>Sent folder (blank = auto-detect)</label><input id="f-folder" value="${esc(cfg.folder || "")}" autocomplete="off"></div>
-      <p class="meta" style="color:var(--muted);font-size:13px">Or set <span class="mono">CADENCE_IMAP_HOST/PORT/USER/PASS</span> env vars, or gitignored <span class="mono">data/imap.json</span>. Credentials are never logged.</p>`;
+      <div class="field"><label>GNOME Online Accounts</label><div id="f-goa" class="meta" style="color:var(--muted);font-size:13px">Checking…</div></div>
+      <p class="meta" style="color:var(--muted);font-size:13px">Resolution order: connector config → <span class="mono">CADENCE_IMAP_HOST/PORT/USER/PASS</span> env → gitignored <span class="mono">data/imap.json</span> → GNOME Online Accounts. GOA credentials come from the keyring via goa-daemon and are never stored by Cadence; explicit host/user/pass above take precedence when set.</p>`;
   } else if (id === "webhook") {
     const keys = cfg.keys || {};
     const rows = Object.entries(keys).map(([k, v]) =>
@@ -332,6 +333,7 @@ async function connSheet(id) {
     <div class="sheet-actions"><button class="btn ghost" id="f-cancel">Cancel</button>
     <button class="btn" id="f-go">Save</button></div>`);
   $("#f-cancel").onclick = closeSheet;
+  if (id === "email-imap") fillGoaBlock(cfg.goa_account || "");
   const nk = $("#f-newkey");
   if (nk) nk.onclick = () => {
     const key = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) + (crypto.randomUUID ? "" : "-hook");
@@ -345,9 +347,33 @@ async function connSheet(id) {
       cfg.host = $("#f-host").value.trim(); cfg.port = $("#f-port").value.trim();
       cfg.user = $("#f-user").value.trim(); cfg.pass = $("#f-pass").value;
       cfg.folder = $("#f-folder").value.trim();
+      const gs = $("#f-goa-account");
+      cfg.goa_account = gs ? gs.value : (cfg.goa_account || "");
     }
     connSheetSave(id, cfg);
   };
+  async function fillGoaBlock(selected) {
+    const el = $("#f-goa");
+    if (!el) return;
+    let g;
+    try { g = await api("/api/connectors/email-imap/goa-accounts"); }
+    catch { el.textContent = "Could not reach the GOA endpoint."; return; }
+    if (!$("#f-goa")) return; // sheet closed while loading
+    if (!g.available) {
+      el.textContent = "GNOME Online Accounts not found on this machine — use host/user/pass above.";
+      return;
+    }
+    if (!g.accounts.length) {
+      el.textContent = "GOA is reachable but has no mail-enabled accounts.";
+      return;
+    }
+    const opts = [`<option value="">First available account</option>`]
+      .concat(g.accounts.map((a) =>
+        `<option value="${esc(a.id)}"${a.id === selected || a.email === selected ? " selected" : ""}>${esc(a.email)} (${esc(a.provider)})</option>`))
+      .join("");
+    el.innerHTML = `<select id="f-goa-account">${opts}</select>
+      <p class="meta" style="color:var(--muted);font-size:12px;margin-top:6px">Credentials come from GNOME Settings and are never stored.</p>`;
+  }
   async function connSheetSave(cid, cfgObj) {
     try {
       await api(`/api/connectors/${cid}`, "POST", { config: cfgObj });

@@ -2,16 +2,25 @@
 // Reads the Sent folder read-only (EXAMINE, never SELECT) so nothing is
 // flagged or modified.
 //
-// Config resolution (first hit wins per field):
+// Config resolution (first hit wins per field, GOA last):
 //   1. connector config passed to sync() (stored in connector_cfg)
 //   2. env: CADENCE_IMAP_HOST, CADENCE_IMAP_PORT, CADENCE_IMAP_USER,
 //      CADENCE_IMAP_PASS, CADENCE_IMAP_FOLDER
 //   3. gitignored JSON file: $CADENCE_DATA_DIR/imap.json (default ./data/imap.json)
 //      { "host": "...", "port": 993, "user": "...", "pass": "...", "folder": "Sent" }
+//   4. GNOME Online Accounts: mail-enabled accounts via goa-daemon; account
+//      selection by `goa_account` (connector config, CADENCE_GOA_ACCOUNT env,
+//      or imap.json) matching email or GOA id, else the first account.
+//      OAuth2 accounts authenticate with SASL XOAUTH2; password accounts with
+//      LOGIN. Credentials are fetched per sync and never stored by Cadence.
 // Credentials are never logged.
 
 import { readFileSync } from "fs";
 import { join } from "path";
+import {
+  listGoaMailAccounts, getGoaCredentials, goaImapCfg,
+  type GoaMailAccount, type GoaCredentials,
+} from "../goa.ts";
 
 class ImapError extends Error {}
 
@@ -75,6 +84,11 @@ export interface ThreadHit {
   count: number;
 }
 
+/** SASL XOAUTH2 initial client response: base64("user=<email>\x01auth=Bearer <token>\x01\x01"). */
+export function xoauth2Blob(user: string, token: string): string {
+  return Buffer.from(`user=${user}\x01auth=Bearer ${token}\x01\x01`, "utf8").toString("base64");
+}
+
 /**
  * Search a folder for messages matching the query (SUBJECT/FROM/TEXT),
  * grouped into threads by normalized subject, newest first. Cap 25.
@@ -82,7 +96,7 @@ export interface ThreadHit {
 export async function searchThreads(opts: {
   query: string; folder?: string; config: any;
 }): Promise<ThreadHit[]> {
-  const cfg = resolveConfig(opts.config); // throws human-readable ImapError when missing
+  const cfg = await resolveConfig(opts.config); // throws human-readable ImapError when missing
   const q = String(opts.query || "").trim();
   if (!q) return [];
   const conn = new Conn();
@@ -90,7 +104,7 @@ export async function searchThreads(opts: {
   try {
     const greet = await conn.greeting();
     if (!/^\* OK/i.test(greet)) throw new ImapError("imap server did not greet");
-    await conn.cmd("t001", `LOGIN ${qstr(cfg.user)} ${qstr(cfg.pass)}`);
+    await authenticate(conn, "t001", cfg);
     const folder = opts.folder || cfg.folder || (await findSentFolder(conn));
     if (!folder) throw new ImapError("imap: could not find a Sent folder");
     await conn.cmd("t002", `EXAMINE ${qstr(folder)}`); // read-only
@@ -253,6 +267,23 @@ class Conn {
     }
   }
 
+  /** SASL XOAUTH2: AUTHENTICATE XOAUTH2, then the base64 blob on the "+" continuation. */
+  async authXoauth2(tag: string, user: string, token: string): Promise<void> {
+    this.sock.write(`${tag} AUTHENTICATE XOAUTH2\r\n`);
+    const cont = await this.readLine();
+    if (!cont.startsWith("+")) {
+      throw new ImapError(`imap XOAUTH2 not offered: ${cont.slice(0, 120)}`);
+    }
+    this.sock.write(`${xoauth2Blob(user, token)}\r\n`);
+    for (;;) {
+      const line = await this.readLine();
+      if (line.startsWith(`${tag} `)) {
+        if (/^OK\b/i.test(line.slice(tag.length + 1))) return;
+        throw new ImapError(`imap XOAUTH2 authentication failed: ${line.slice(0, 120)}`);
+      }
+    }
+  }
+
   close() {
     try { this.sock.write("a999 LOGOUT\r\n"); } catch { /* gone */ }
     try { this.sock.end(); } catch { /* gone */ }
@@ -275,27 +306,79 @@ async function findSentFolder(conn: Conn): Promise<string | null> {
   return null;
 }
 
-function resolveConfig(overrides: any): { host: string; port: number; user: string; pass: string; folder?: string } {
+/** Pick LOGIN or SASL XOAUTH2 based on the resolved config. */
+async function authenticate(conn: Conn, tag: string, cfg: ImapCfg): Promise<void> {
+  if (cfg.auth === "xoauth2") {
+    await conn.authXoauth2(tag, cfg.user, cfg.pass);
+  } else {
+    await conn.cmd(tag, `LOGIN ${qstr(cfg.user)} ${qstr(cfg.pass)}`);
+  }
+}
+
+export interface ImapCfg {
+  host: string; port: number; user: string; pass: string; folder?: string;
+  auth: "login" | "xoauth2"; // internal — never shown in the UI
+  goaId?: string;            // GOA account id when credentials came from GOA
+}
+
+const MISSING_CREDENTIALS =
+  "email-imap: missing IMAP credentials — set host/user/pass via connector config, " +
+  "CADENCE_IMAP_* env vars, or $CADENCE_DATA_DIR/imap.json, " +
+  "or add a mail account in GNOME Settings (Online Accounts)";
+
+/** Injectable GOA functions so tests never touch D-Bus. */
+export interface GoaFns {
+  listGoaMailAccounts(): Promise<GoaMailAccount[]>;
+  getGoaCredentials(a: GoaMailAccount): Promise<GoaCredentials>;
+}
+const realGoaFns: GoaFns = { listGoaMailAccounts, getGoaCredentials };
+
+async function resolveConfig(overrides: any, goaFns: GoaFns = realGoaFns): Promise<ImapCfg> {
   let fileCfg: any = {};
   try {
     const dir = process.env.CADENCE_DATA_DIR || "data";
     fileCfg = JSON.parse(readFileSync(join(dir, "imap.json"), "utf8"));
   } catch { /* optional file */ }
   const o = overrides && typeof overrides === "object" ? overrides : {};
-  const cfg = {
+  const cfg: ImapCfg = {
     host: o.host || process.env.CADENCE_IMAP_HOST || fileCfg.host || "",
     port: Number(o.port || process.env.CADENCE_IMAP_PORT || fileCfg.port || 993),
     user: o.user || process.env.CADENCE_IMAP_USER || fileCfg.user || "",
     pass: o.pass || process.env.CADENCE_IMAP_PASS || fileCfg.pass || "",
     folder: o.folder || process.env.CADENCE_IMAP_FOLDER || fileCfg.folder || undefined,
+    auth: "login",
   };
-  if (!cfg.host || !cfg.user || !cfg.pass) {
-    throw new ImapError(
-      "email-imap: missing IMAP credentials — set host/user/pass via connector config, " +
-      "CADENCE_IMAP_* env vars, or $CADENCE_DATA_DIR/imap.json"
-    );
+  if (cfg.host && cfg.user && cfg.pass) return cfg; // explicit credentials win
+
+  // GOA fallback — credentials come from the keyring via goa-daemon,
+  // fetched per sync and never written to Cadence's DB.
+  const sel = String(o.goa_account || process.env.CADENCE_GOA_ACCOUNT || fileCfg.goa_account || "")
+    .toLowerCase().trim();
+  let accounts: GoaMailAccount[] = [];
+  try {
+    accounts = await goaFns.listGoaMailAccounts();
+  } catch { /* GOA unreachable/absent → fall through to the human-readable error */ }
+  const acct = sel
+    ? accounts.find((a) => a.email.toLowerCase() === sel || a.id.toLowerCase() === sel)
+    : accounts[0];
+  if (!acct) {
+    if (sel && accounts.length) {
+      const have = accounts.map((a) => a.email).join(", ");
+      throw new ImapError(`email-imap: no GOA mail account matches "${sel}" (have: ${have})`);
+    }
+    throw new ImapError(MISSING_CREDENTIALS + " …and no GNOME Online Accounts mail account found");
   }
-  return cfg;
+  const imap = goaImapCfg(acct); // throws human-readable GoaError on missing host / STARTTLS
+  const creds = await goaFns.getGoaCredentials(acct); // auth failures propagate (human-readable)
+  if (creds.oauth2 && creds.token) {
+    return { ...cfg, host: imap.host, port: imap.port, user: imap.user, pass: creds.token,
+             auth: "xoauth2", goaId: acct.id };
+  }
+  if (creds.imapPassword) {
+    return { ...cfg, host: imap.host, port: imap.port, user: imap.user, pass: creds.imapPassword,
+             auth: "login", goaId: acct.id };
+  }
+  throw new ImapError(`email-imap: GOA account ${acct.email} returned no usable credentials`);
 }
 
 export const connector = {
@@ -303,15 +386,16 @@ export const connector = {
   name: "Email (IMAP sent folder)",
   description:
     "Counts messages in your Sent folder per day over a date range. Read-only (EXAMINE). " +
-    "Configure host/user/pass via connector config, CADENCE_IMAP_* env, or data/imap.json.",
+    "Configure host/user/pass via connector config, CADENCE_IMAP_* env, or data/imap.json — " +
+    "or leave blank to use a GNOME Online Accounts mail account (OAuth2 → XOAUTH2, creds never stored).",
   async sync(opts: { from: string; to: string; config: any }) {
-    const cfg = resolveConfig(opts.config); // never logged
+    const cfg = await resolveConfig(opts.config); // never logged
     const conn = new Conn();
     await conn.open(cfg.host, cfg.port);
     try {
       const greet = await conn.greeting();
       if (!/^\* OK/i.test(greet)) throw new ImapError("imap server did not greet");
-      await conn.cmd("a001", `LOGIN ${qstr(cfg.user)} ${qstr(cfg.pass)}`);
+      await authenticate(conn, "a001", cfg);
       const folder = cfg.folder || (await findSentFolder(conn));
       if (!folder) throw new ImapError("imap: could not find a Sent folder");
       await conn.cmd("a002", `EXAMINE ${qstr(folder)}`); // read-only
@@ -352,4 +436,4 @@ export const connector = {
 };
 
 // Exported for tests (pure helpers, no network).
-export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader };
+export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob };

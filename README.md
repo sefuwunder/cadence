@@ -76,12 +76,25 @@ Built-ins:
 | id | kind | config |
 |----|------|--------|
 | `manual` | no-op (manual entry is native) | none |
-| `email-imap` | counts messages in the Sent folder per day via `INTERNALDATE` | env `CADENCE_IMAP_HOST/PORT/USER/PASS/FOLDER`, or `data/imap.json` (gitignored), or the in-app setup form |
+| `email-imap` | counts messages in the Sent folder per day via `INTERNALDATE` | env `CADENCE_IMAP_HOST/PORT/USER/PASS/FOLDER`, or `data/imap.json` (gitignored), or the in-app setup form, or **GNOME Online Accounts** (see below) |
 | `webhook` | **inbound**: `POST /api/hooks/:key` `{kpi_id, date, value, note?}` | keys managed in the in-app connector setup; invalid key → 401 |
 
 The IMAP client is read-only (`EXAMINE`, never `SELECT`), opens one TLS connection
 per sync, and resolves the Sent folder by `LIST` name matching (`*sent*`, `*gesendet*`,
 …), falling back to `INBOX` only if nothing matches.
+
+**GNOME Online Accounts email backend.** When no explicit host/user/pass is set
+anywhere, `email-imap` falls back to GOA: mail-enabled accounts are read from
+goa-daemon over D-Bus, the account is picked by `goa_account` (connector config,
+`CADENCE_GOA_ACCOUNT` env, or `data/imap.json` — matches email or GOA id,
+case-insensitive) or the first account otherwise. OAuth2 accounts authenticate
+with SASL XOAUTH2; password accounts with LOGIN. Credentials come from the
+keyring via goa-daemon, are fetched fresh on every sync/thread search, and are
+never written to Cadence's DB — only the selected account id/email is stored in
+the connector config. Pick the account in the in-app email setup
+(`GET /api/connectors/email-imap/goa-accounts` lists what's available). Full
+resolution order: connector config → `CADENCE_IMAP_*` env → `data/imap.json` →
+GNOME Online Accounts.
 
 ## API
 
@@ -98,6 +111,9 @@ DELETE              /api/links/:linkId                → 204
 GET                 /api/connectors/email-imap/threads?q=…[&folder=…]
                       → { threads: [{ thread_key, subject, from, date, count }] }
                       (400 when IMAP is unconfigured)
+GET                 /api/connectors/email-imap/goa-accounts
+                      → { available, accounts: [{ id, email, provider }] }
+                      (never 500s; GOA absent → { available: false, accounts: [] })
 POST                /api/kpis/:kpiId/entries  {date, value, note?}   (source: manual)
 DELETE              /api/kpis/:kpiId/entries/:entryId
 GET/POST            /api/connectors           (list; save config)

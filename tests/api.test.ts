@@ -7,6 +7,7 @@ import { createApp } from "../src/server.ts";
 import { connectors } from "../src/connectors/index.ts";
 import { _test as imapTest } from "../src/connectors/email-imap.ts";
 import { keyIsValid } from "../src/connectors/webhook.ts";
+import { listGoaMailAccounts, getGoaCredentials, goaImapCfg, goaAvailable } from "../src/goa.ts";
 
 let app: ReturnType<typeof createApp>;
 let tmp: string;
@@ -219,10 +220,38 @@ describe("email-imap helpers", () => {
     expect(imapTest.internalDateToIso("5-Jan-2025 00:00:00 -0500")).toBe("2025-01-05");
     expect(imapTest.internalDateToIso("garbage")).toBe("");
   });
-  test("resolveConfig demands credentials", () => {
-    expect(() => imapTest.resolveConfig({})).toThrow(/missing IMAP credentials/);
-    const c = imapTest.resolveConfig({ host: "h", user: "u", pass: "p" });
+  test("resolveConfig demands credentials", async () => {
+    const noGoa = {
+      listGoaMailAccounts: async () => [] as any[],
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    await expect(imapTest.resolveConfig({}, noGoa)).rejects.toThrow(/missing IMAP credentials/);
+    const c = await imapTest.resolveConfig({ host: "h", user: "u", pass: "p" }, noGoa);
     expect(c.port).toBe(993);
+    expect(c.auth).toBe("login");
+  });
+  test("resolveConfig: explicit config wins, GOA never consulted", async () => {
+    let listed = false;
+    const goaFns = {
+      listGoaMailAccounts: async () => { listed = true; return [] as any[]; },
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    const c = await imapTest.resolveConfig({ host: "h", user: "u", pass: "p" }, goaFns);
+    expect(c.auth).toBe("login");
+    expect(c.host).toBe("h");
+    expect(listed).toBe(false);
+  });
+  test("resolveConfig: GOA absent/unreachable → human-readable error", async () => {
+    const empty = {
+      listGoaMailAccounts: async () => [] as any[],
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    await expect(imapTest.resolveConfig({}, empty)).rejects.toThrow(/no GNOME Online Accounts mail account found/);
+    const throwing = {
+      listGoaMailAccounts: async (): Promise<any[]> => { throw new Error("boom"); },
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    await expect(imapTest.resolveConfig({}, throwing)).rejects.toThrow(/no GNOME Online Accounts mail account found/);
   });
   test("sync without config fails with human message", async () => {
     const conn = connectors.get("email-imap")!;
@@ -243,6 +272,157 @@ describe("email-imap helpers", () => {
   test("decodeHeader handles RFC 2047", () => {
     expect(imapTest.decodeHeader("=?UTF-8?B?RGVsaXZlcnkgS2lja29mZg==?=")).toBe("Delivery Kickoff");
     expect(imapTest.decodeHeader("plain subject")).toBe("plain subject");
+  });
+});
+
+describe("goa", () => {
+  const acctObj = (over: { acc?: any; mail?: any; ifaces?: string[] } = {}) => {
+    const ifaces: Record<string, any> = {
+      "org.gnome.OnlineAccounts.Account": {
+        Id: "goa_account_1", ProviderType: "google", ProviderName: "Google",
+        MailEnabled: true, PresentationIdentity: "user@gmail.com",
+        ...(over.acc || {}),
+      },
+      "org.gnome.OnlineAccounts.Mail": {
+        EmailAddress: "user@gmail.com", ImapHost: "imap.gmail.com",
+        ImapUserName: "user@gmail.com", ImapUseSsl: true,
+        ...(over.mail || {}),
+      },
+    };
+    for (const i of over.ifaces || ["org.gnome.OnlineAccounts.OAuth2Based"]) ifaces[i] = {};
+    return ifaces;
+  };
+  // Stub RunFn answering busctl --json=short calls by method name.
+  const goaStub = (objects: Record<string, any>, extra: Record<string, any> = {}) =>
+    async (_cmd: string, args: string[]) => {
+      const method = args[6];
+      if (method === "GetManagedObjects")
+        return { code: 0, stdout: JSON.stringify({ type: "(a{oa{sa{sv}}})", data: [objects] }), stderr: "" };
+      if (method === "EnsureCredentials")
+        return { code: 0, stdout: JSON.stringify({ type: "()", data: [] }), stderr: "" };
+      if (method === "GetAccessToken")
+        return { code: 0, stdout: JSON.stringify({ type: "s", data: ["tok123"] }), stderr: "" };
+      if (method === "GetPassword")
+        return { code: 0, stdout: JSON.stringify({ type: "s", data: [extra.password || "pw456"] }), stderr: "" };
+      throw new Error("unexpected D-Bus method: " + method);
+    };
+
+  test("listGoaMailAccounts honors MailEnabled/MailDisabled variants", async () => {
+    const objects = {
+      "/p/1": acctObj(),
+      "/p/2": acctObj({ acc: { Id: "goa_account_2", MailDisabled: true, PresentationIdentity: "off@x.com" },
+                         mail: { EmailAddress: "off@x.com" } }),
+      "/p/3": { "org.gnome.OnlineAccounts.Account": { Id: "goa_account_3", MailEnabled: true } }, // no Mail iface
+    };
+    const accounts = await listGoaMailAccounts(goaStub(objects));
+    expect(accounts.length).toBe(1);
+    expect(accounts[0].email).toBe("user@gmail.com");
+    expect(accounts[0].imapHost).toBe("imap.gmail.com");
+    expect(accounts[0].oauth2).toBe(true);
+  });
+
+  test("getGoaCredentials: oauth2 path", async () => {
+    const objects = { "/p/1": acctObj() };
+    const [acct] = await listGoaMailAccounts(goaStub(objects));
+    const creds = await getGoaCredentials(acct, goaStub(objects));
+    expect(creds).toEqual({ user: "user@gmail.com", oauth2: true, token: "tok123" });
+  });
+
+  test("getGoaCredentials: passwordBased path", async () => {
+    const objects = { "/p/1": acctObj({ ifaces: ["org.gnome.OnlineAccounts.PasswordBased"] }) };
+    const [acct] = await listGoaMailAccounts(goaStub(objects));
+    expect(acct.passwordBased).toBe(true);
+    const creds = await getGoaCredentials(acct, goaStub(objects));
+    expect(creds.user).toBe("user@gmail.com");
+    expect(creds.oauth2).toBe(false);
+    expect(creds.imapPassword).toBe("pw456");
+  });
+
+  test("getGoaCredentials: auth failure when EnsureCredentials fails", async () => {
+    const run = async (_c: string, args: string[]) => {
+      if (args[6] === "EnsureCredentials") return { code: 1, stdout: "", stderr: "org.freedesktop.DBus.Error.Failed" };
+      throw new Error("unexpected");
+    };
+    const acct = (await listGoaMailAccounts(goaStub({ "/p/1": acctObj() })))[0];
+    await expect(getGoaCredentials(acct, run)).rejects.toThrow(/re-authenticate in GNOME Settings/);
+  });
+
+  test("goaImapCfg maps SSL→993 and rejects STARTTLS", () => {
+    const base: any = { email: "u@x.com", imapHost: "imap.x.com", imapUser: "u@x.com", imapSsl: true };
+    expect(goaImapCfg(base)).toEqual({ host: "imap.x.com", port: 993, user: "u@x.com", secure: true });
+    expect(() => goaImapCfg({ ...base, imapSsl: false })).toThrow(/STARTTLS/);
+    expect(() => goaImapCfg({ ...base, imapHost: "" })).toThrow(/no IMAP host/);
+  });
+
+  test("goaAvailable is false when busctl is missing", async () => {
+    const run = async () => { throw new Error("spawn busctl ENOENT"); };
+    expect(await goaAvailable(run as any)).toBe(false);
+  });
+});
+
+describe("xoauth2 + GOA-backed resolveConfig", () => {
+  const oauthAcct: any = {
+    objectPath: "/p/1", id: "goa_account_1", providerType: "google", providerName: "Google",
+    email: "user@gmail.com", imapHost: "imap.gmail.com", imapUser: "user@gmail.com",
+    imapSsl: true, imapTls: false, oauth2: true, passwordBased: false,
+  };
+  const oauthFns = {
+    listGoaMailAccounts: async () => [oauthAcct],
+    getGoaCredentials: async (_a: any) => ({ user: "user@gmail.com", oauth2: true, token: "tok123" }),
+  };
+
+  test("xoauth2Blob format", () => {
+    const blob = imapTest.xoauth2Blob("user@gmail.com", "tok123");
+    expect(Buffer.from(blob, "base64").toString("utf8"))
+      .toBe("user=user@gmail.com\x01auth=Bearer tok123\x01\x01");
+  });
+
+  test("GOA OAuth2 account resolves to xoauth2", async () => {
+    const c = await imapTest.resolveConfig({}, oauthFns as any);
+    expect(c.host).toBe("imap.gmail.com");
+    expect(c.port).toBe(993);
+    expect(c.user).toBe("user@gmail.com");
+    expect(c.pass).toBe("tok123");
+    expect(c.auth).toBe("xoauth2");
+    expect(c.goaId).toBe("goa_account_1");
+  });
+
+  test("GOA password account resolves to login", async () => {
+    const fns = {
+      listGoaMailAccounts: async () => [oauthAcct],
+      getGoaCredentials: async (_a: any) => ({ user: "user@gmail.com", oauth2: false, imapPassword: "pw456" }),
+    };
+    const c = await imapTest.resolveConfig({}, fns as any);
+    expect(c.auth).toBe("login");
+    expect(c.pass).toBe("pw456");
+  });
+
+  test("goa_account selects by email (case-insensitive) or id", async () => {
+    const a2 = { ...oauthAcct, id: "goa_account_2", email: "b@x.com", imapUser: "b@x.com" };
+    const fns = {
+      listGoaMailAccounts: async () => [oauthAcct, a2],
+      getGoaCredentials: async (a: any) => ({ user: a.email, oauth2: false, imapPassword: "pw" }),
+    };
+    const byEmail = await imapTest.resolveConfig({ goa_account: "B@X.COM" }, fns as any);
+    expect(byEmail.user).toBe("b@x.com");
+    const byId = await imapTest.resolveConfig({ goa_account: "goa_account_1" }, fns as any);
+    expect(byId.user).toBe("user@gmail.com");
+    const first = await imapTest.resolveConfig({}, fns as any);
+    expect(first.user).toBe("user@gmail.com");
+    await expect(imapTest.resolveConfig({ goa_account: "nope@x.com" }, fns as any))
+      .rejects.toThrow(/no GOA mail account matches/);
+  });
+
+  test("goa-accounts endpoint never 500s and has the right shape", async () => {
+    const { status, data } = await call("GET", "/api/connectors/email-imap/goa-accounts");
+    expect(status).toBe(200);
+    expect(typeof data.available).toBe("boolean");
+    expect(Array.isArray(data.accounts)).toBe(true);
+    for (const a of data.accounts) {
+      expect(typeof a.id).toBe("string");
+      expect(typeof a.email).toBe("string");
+      expect(typeof a.provider).toBe("string");
+    }
   });
 });
 

@@ -49,12 +49,22 @@ then `CADENCE_<ID>_*` env vars, then a gitignored JSON file under
 `$CADENCE_DATA_DIR/`. Document the fields in your connector's `description`
 or a comment block.
 
+The `email-imap` connector adds a fourth source: **GNOME Online Accounts**.
+When no explicit host/user/pass is configured anywhere, it reads mail-enabled
+accounts from goa-daemon over D-Bus (`src/goa.ts` — busctl, no D-Bus library).
+Account selection: `goa_account` in the connector config (or
+`CADENCE_GOA_ACCOUNT` env / `imap.json`) matching email or GOA id, else the
+first account. OAuth2 accounts use SASL XOAUTH2, password accounts use LOGIN.
+GOA credentials are fetched on demand per sync/thread search and never
+persisted — only the selected account id is stored. `goaAvailable()` /
+`listGoaMailAccounts()` never throw on an absent GOA; they report it.
+
 ## The three built-ins
 
 | id | mode | notes |
 |----|------|-------|
 | `manual` | no-op | Metrics entered by hand; `sync()` returns `[]`. |
-| `email-imap` | poll + thread search | Counts Sent-folder messages per day; also powers email-thread evidence linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, or `data/imap.json` (gitignored). Read-only. |
+| `email-imap` | poll + thread search | Counts Sent-folder messages per day; also powers email-thread evidence linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, `data/imap.json` (gitignored), or GNOME Online Accounts (`goa_account` selection; OAuth2 → XOAUTH2, creds never stored). Read-only. |
 | `webhook` | inbound | External systems `POST /api/hooks/:key` with `{kpi_id, date, value, note}`. Keys live in its connector config: `{keys: {"<uuid>": {"label": "..."}}}`. `sync()` is a no-op. |
 
 ## Testing a new connector
