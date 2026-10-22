@@ -8,6 +8,7 @@ import { readFileSync, existsSync, mkdirSync } from "fs";
 import { initDb, seedIfEmpty } from "./db.ts";
 import { getConnector, connectors } from "./connectors/index.ts";
 import { keyIsValid } from "./connectors/webhook.ts";
+import { searchThreads } from "./connectors/email-imap.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -85,13 +86,29 @@ function getDashboard(db: Database, runId: string): any | null {
     byKpi.get(e.kpi_id)!.push(e);
   }
 
+  // Evidence links, attached per task.
+  const links: any[] = db.query(
+    "SELECT * FROM task_links WHERE task_id IN (SELECT id FROM tasks WHERE run_id = ?) ORDER BY created_at DESC"
+  ).all(runId);
+  const byTask = new Map<string, any[]>();
+  for (const l of links) {
+    if (!byTask.has(l.task_id)) byTask.set(l.task_id, []);
+    byTask.get(l.task_id)!.push({
+      id: l.id, source: l.source, kind: l.kind, ref: l.ref, label: l.label,
+      meta: JSON.parse(l.meta_json || "{}"), created_at: l.created_at,
+    });
+  }
+
   const weeks = tpl.weeks.map((w: any, i: number) => {
     const week = i + 1;
     const { from, to } = weekRange(run.start_date, week);
     const wt = tasks.filter((t) => t.week === week);
     const roles: Record<string, any[]> = {};
     for (const t of wt) {
-      (roles[t.role] ||= []).push({ id: t.id, title: t.title, done: !!t.done, done_at: t.done_at });
+      (roles[t.role] ||= []).push({
+        id: t.id, title: t.title, done: !!t.done, done_at: t.done_at,
+        links: byTask.get(t.id) || [],
+      });
     }
     const done = wt.filter((t) => t.done).length;
     return { week, theme: w.theme, from, to, roles, tasks_done: done, tasks_total: wt.length };
@@ -239,6 +256,7 @@ export function createApp(opts: { dbPath: string }) {
           const kpis: any[] = db.query("SELECT id FROM kpis WHERE run_id = ?").all(id);
           const tx = db.transaction(() => {
             for (const k of kpis) db.run("DELETE FROM metric_entries WHERE kpi_id = ?", [k.id]);
+            db.run("DELETE FROM task_links WHERE task_id IN (SELECT id FROM tasks WHERE run_id = ?)", [id]);
             db.run("DELETE FROM kpis WHERE run_id = ?", [id]);
             db.run("DELETE FROM tasks WHERE run_id = ?", [id]);
             db.run("DELETE FROM runs WHERE id = ?", [id]);
@@ -282,6 +300,31 @@ export function createApp(opts: { dbPath: string }) {
         return json({ ok: true });
       }
 
+      // ----- task links -----
+      pm = path.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/links$/);
+      if (pm && m === "POST") {
+        const [runId, taskId] = [decodeURIComponent(pm[1]), decodeURIComponent(pm[2])];
+        const t: any = db.query("SELECT id FROM tasks WHERE id = ? AND run_id = ?").get(taskId, runId);
+        if (!t) return err(404, "task not found");
+        const b = await body(req);
+        const label = String(b?.label || "").trim();
+        if (!label) return err(400, "label is required");
+        const source = /^[a-z0-9-]{1,40}$/.test(String(b?.source || "manual")) ? b.source : "manual";
+        const kind = String(b?.kind || "note").slice(0, 40);
+        const meta = b?.meta && typeof b.meta === "object" ? b.meta : {};
+        const id = uuid();
+        db.run(
+          "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 500),
+           JSON.stringify(meta), new Date().toISOString()]);
+        return json({ id }, 201);
+      }
+      pm = path.match(/^\/api\/links\/([^/]+)$/);
+      if (pm && m === "DELETE") {
+        db.run("DELETE FROM task_links WHERE id = ?", [decodeURIComponent(pm[1])]);
+        return new Response(null, { status: 204 });
+      }
+
       // ----- connectors -----
       if (path === "/api/connectors" && m === "GET") {
         const cfgs = new Set(
@@ -289,6 +332,21 @@ export function createApp(opts: { dbPath: string }) {
         return json([...connectors.values()].map((c) => ({
           id: c.id, name: c.name, description: c.description, configured: cfgs.has(c.id),
         })));
+      }
+      // Email thread search (evidence linking). Before the generic :id block.
+      pm = path.match(/^\/api\/connectors\/email-imap\/threads$/);
+      if (pm && m === "GET") {
+        const q = (url.searchParams.get("q") || "").trim();
+        if (!q) return json({ threads: [] });
+        const folder = url.searchParams.get("folder") || undefined;
+        const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
+        const config = row ? JSON.parse(row.config_json) : {};
+        try {
+          return json({ threads: await searchThreads({ query: q, folder, config }) });
+        } catch (e: any) {
+          const msg = e?.message || "thread search failed";
+          return err(/missing IMAP credentials/.test(msg) ? 400 : 502, msg);
+        }
       }
       pm = path.match(/^\/api\/connectors\/([^/]+)$/);
       if (pm && (m === "GET" || m === "POST")) {
@@ -348,6 +406,21 @@ export function createApp(opts: { dbPath: string }) {
           return err(401, "invalid hook key");
         }
         const b = await body(req);
+        // Link-evidence shape: { task_id, kind?, ref?, label, meta? }.
+        // Metric shape (existing): { kpi_id, date, value, note? }.
+        if (b?.task_id) {
+          const t: any = db.query("SELECT id FROM tasks WHERE id = ?").get(b.task_id);
+          if (!t) return err(404, "task not found");
+          const label = String(b.label || b.ref || "").trim();
+          if (!label) return err(400, "label is required");
+          const meta = b?.meta && typeof b.meta === "object" ? b.meta : {};
+          const id = uuid();
+          db.run(
+            "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, 'webhook', ?, ?, ?, ?, ?)",
+            [id, b.task_id, String(b.kind || "record").slice(0, 40), String(b.ref || "").slice(0, 200),
+             label.slice(0, 500), JSON.stringify(meta), new Date().toISOString()]);
+          return json({ id }, 201);
+        }
         if (!b?.kpi_id) return err(400, "kpi_id is required");
         const k: any = db.query("SELECT id FROM kpis WHERE id = ?").get(b.kpi_id);
         if (!k) return err(404, "kpi not found");

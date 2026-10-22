@@ -30,6 +30,25 @@ Hit **+** in the top bar to start a run from it.
   and a Connectors section for setup.
 - **Activity** — evidence feed: task completions + metric entries with source badges.
 
+## Task evidence
+
+Any source of truth can be mapped to an individual playbook task: tap the 🔗 on a
+task row to open its evidence sheet — linked items (email threads, manual notes,
+webhook records) with source badges, plus unlink buttons.
+
+- **Email threads** — search your mail by subject/from/text; results are grouped
+  into threads by normalized subject (Re:/Fwd:/[tags] stripped, case-insensitive —
+  no JWZ). Linking a thread stores one row (`kind: thread`, ref = the normalized
+  subject, meta carries from/date/message count). One row per thread, manual
+  linking only (no auto-rules in v1).
+- **Manual note** — free-text note linked as `source: manual, kind: note`.
+- **Webhook** — any system can link evidence: `POST /api/hooks/:key`
+  `{ "task_id", "kind", "ref", "label", "meta"? }`.
+
+`task_links` table: `id, task_id, source, kind, ref, label, meta_json, created_at`.
+`source` is the connector id (also the UI badge); `kind` is
+`thread`/`message`/`note`/`record`; `ref` is the source's identifier.
+
 ## Connectors
 
 A connector feeds KPI actuals from an outside system. Drop one file in
@@ -73,12 +92,19 @@ GET                 /api/runs/:id             → dashboard payload (weeks, task
                                               role/week, kpis w/ targets + weekly
                                               actuals, overall %, activity feed)
 POST                /api/runs/:id/tasks/:taskId/toggle
+POST                /api/runs/:id/tasks/:taskId/links  {source?, kind?, ref?, label, meta?} → 201
+DELETE              /api/links/:linkId                → 204
+                      (tasks in the dashboard payload carry links[])
+GET                 /api/connectors/email-imap/threads?q=…[&folder=…]
+                      → { threads: [{ thread_key, subject, from, date, count }] }
+                      (400 when IMAP is unconfigured)
 POST                /api/kpis/:kpiId/entries  {date, value, note?}   (source: manual)
 DELETE              /api/kpis/:kpiId/entries/:entryId
 GET/POST            /api/connectors           (list; save config)
 GET                 /api/connectors/:id
 POST                /api/connectors/:id/sync  {kpi_id, from, to}
-POST                /api/hooks/:key           {kpi_id, date, value, note?}
+POST                /api/hooks/:key           {kpi_id, date, value, note?}   (metric)
+POST                /api/hooks/:key           {task_id, kind?, ref?, label, meta?}  (task link)
 ```
 
 Weeks are UTC date ranges `[start + 7·(w-1), start + 7·w)`; the "current week" is

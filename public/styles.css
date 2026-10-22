@@ -89,6 +89,30 @@ select { max-width: 46vw; }
 .task.done .check { background: var(--gold); border-color: var(--gold); color: #17130a; }
 .task-title { flex: 1; font-size: 15.5px; }
 
+/* evidence affordance */
+.task .ev {
+  flex: 0 0 auto; background: none; border: 0; color: var(--faint);
+  cursor: pointer; min-width: 44px; min-height: 44px; padding: 0;
+  display: flex; align-items: center; justify-content: center; gap: 3px;
+}
+.task .ev .ev-ico { font-size: 16px; opacity: 0.75; }
+.task .ev.has { color: var(--gold); }
+.task .ev.has .ev-ico { opacity: 1; }
+.ev-n {
+  font-size: 11px; font-weight: 700; background: var(--gold-dim); color: var(--gold);
+  border-radius: 99px; padding: 1px 7px;
+}
+.link-row, .thread-row {
+  display: flex; gap: 10px; align-items: center;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+.link-row:last-child, .thread-row:last-child { border-bottom: 0; }
+.link-row .link-body, .thread-row .thread-body { flex: 1; font-size: 14px; min-width: 0; }
+.link-row .meta, .thread-row .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.link-row .link-body b, .thread-row .thread-body b {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* ---------- progress bars ---------- */
 .bar { height: 8px; background: var(--ink-3); border-radius: 99px; overflow: hidden; margin: 8px 0 4px; }
 .bar > i { display: block; height: 100%; background: linear-gradient(90deg, #a8841f, var(--gold)); border-radius: 99px; }

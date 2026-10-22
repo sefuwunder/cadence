@@ -228,4 +228,99 @@ describe("email-imap helpers", () => {
     const conn = connectors.get("email-imap")!;
     await expect(conn.sync({ from: today(), to: today(), config: {} })).rejects.toThrow(/missing IMAP credentials/);
   });
+  test("normalizeSubject groups reply/forward variants", () => {
+    const n = imapTest.normalizeSubject;
+    const k = n("Delivery Kickoff");
+    expect(k).toBe("delivery kickoff");
+    expect(n("Re: Delivery Kickoff")).toBe(k);
+    expect(n("RE: re: Fwd: delivery kickoff")).toBe(k);
+    expect(n("Fw:  Delivery   Kickoff")).toBe(k);
+    expect(n("[EXTERNAL] Re: Delivery Kickoff")).toBe(k);
+    expect(n("Aw: Lieferung Start")).toBe("lieferung start");
+    expect(n("Something else entirely")).not.toBe(k);
+    expect(n("")).toBe("");
+  });
+  test("decodeHeader handles RFC 2047", () => {
+    expect(imapTest.decodeHeader("=?UTF-8?B?RGVsaXZlcnkgS2lja29mZg==?=")).toBe("Delivery Kickoff");
+    expect(imapTest.decodeHeader("plain subject")).toBe("plain subject");
+  });
+});
+
+describe("task links", () => {
+  let linkTaskId = "";
+  let linkId = "";
+  const dashTask = async () => {
+    const d = await call("GET", `/api/runs/${runId}`);
+    return d.data.weeks[0].roles.CEO[0];
+  };
+
+  test("tasks carry empty links[] in dashboard", async () => {
+    const t = await dashTask();
+    linkTaskId = t.id;
+    expect(t.links).toEqual([]);
+  });
+
+  test("link CRUD round-trip", async () => {
+    const created = await call("POST", `/api/runs/${runId}/tasks/${linkTaskId}/links`, {
+      source: "email-imap", kind: "thread", ref: "delivery kickoff",
+      label: "Re: Delivery Kickoff",
+      meta: { from: "jane@acme.com", date: "2026-10-22", count: 4 },
+    });
+    expect(created.status).toBe(201);
+    linkId = created.data.id;
+    const t = await dashTask();
+    expect(t.links.length).toBe(1);
+    expect(t.links[0]).toMatchObject({
+      source: "email-imap", kind: "thread", ref: "delivery kickoff", label: "Re: Delivery Kickoff",
+    });
+    expect(t.links[0].meta).toEqual({ from: "jane@acme.com", date: "2026-10-22", count: 4 });
+    const del = await call("DELETE", `/api/links/${linkId}`);
+    expect(del.status).toBe(204);
+    expect((await dashTask()).links).toEqual([]);
+  });
+
+  test("link validation: label required, task must belong to run", async () => {
+    expect((await call("POST", `/api/runs/${runId}/tasks/${linkTaskId}/links`,
+      { source: "manual" })).status).toBe(400);
+    expect((await call("POST", `/api/runs/${runId}/tasks/nope/links`,
+      { label: "x" })).status).toBe(404);
+    // task exists but in another run
+    const r2 = await call("POST", "/api/runs", { playbook_id: seedPbId, start_date: today() });
+    expect(r2.status).toBe(201);
+    expect((await call("POST", `/api/runs/${r2.data.id}/tasks/${linkTaskId}/links`,
+      { label: "x" })).status).toBe(404);
+    await call("DELETE", `/api/runs/${r2.data.id}`);
+  });
+
+  test("webhook creates task links", async () => {
+    const KEY = "test-key-123"; // configured in the webhook suite above
+    const r = await call("POST", `/api/hooks/${KEY}`, {
+      task_id: linkTaskId, kind: "thread", ref: "kickoff", label: "Delivery Kickoff",
+    });
+    expect(r.status).toBe(201);
+    const t = await dashTask();
+    expect(t.links.some((l: any) => l.source === "webhook" && l.label === "Delivery Kickoff")).toBe(true);
+    await call("DELETE", `/api/links/${r.data.id}`);
+  });
+
+  test("webhook link rejects bad key / bad body", async () => {
+    expect((await call("POST", "/api/hooks/wrong",
+      { task_id: linkTaskId, label: "x" })).status).toBe(401);
+    expect((await call("POST", "/api/hooks/test-key-123",
+      { task_id: "nope", label: "x" })).status).toBe(404);
+    expect((await call("POST", "/api/hooks/test-key-123",
+      { task_id: linkTaskId })).status).toBe(400);
+    // metric shape still works alongside
+    expect((await call("POST", "/api/hooks/test-key-123",
+      { kpi_id: kpiId, date: today(), value: 1 })).status).toBe(201);
+  });
+
+  test("thread search 400s when IMAP unconfigured", async () => {
+    const r = await call("GET", "/api/connectors/email-imap/threads?q=kickoff");
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/missing IMAP credentials/);
+    const empty = await call("GET", "/api/connectors/email-imap/threads");
+    expect(empty.status).toBe(200);
+    expect(empty.data.threads).toEqual([]);
+  });
 });

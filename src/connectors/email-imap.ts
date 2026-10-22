@@ -32,6 +32,138 @@ function internalDateToIso(d: string): string {
   return `${m[3]}-${String(mon + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
 }
 
+// ---------- thread search ----------
+// Pragmatic threading: a "thread" is a normalized-subject group. No JWZ.
+// Strips reply/forward prefixes (several languages) and [bracket] tags,
+// then lowercases + collapses whitespace.
+
+const THREAD_PREFIXES = /^(?:re|fwd?|aw|wg|sv|vs|tr|antw|enc|odp)\s*:/i;
+
+export function normalizeSubject(subject: string): string {
+  let s = String(subject || "");
+  for (let i = 0; i < 10; i++) {
+    const t = s
+      .replace(/^\s*\[[^\][\r\n]*\]\s*/, "") // [EXTERNAL], [Ticket #12], …
+      .replace(THREAD_PREFIXES, "")
+      .trim();
+    if (t === s) break;
+    s = t;
+  }
+  return s.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** Minimal RFC 2047 decoder (=?UTF-8?B|Q?...?=). Returns best effort. */
+export function decodeHeader(s: string): string {
+  return String(s || "").replace(/=\?([^?\s]+)\?([bBqQ])\?([^?]*)\?=/g, (_m, _cs, enc, text) => {
+    try {
+      if (String(enc).toUpperCase() === "B") return Buffer.from(text, "base64").toString("utf8");
+      const qp = String(text)
+        .replace(/_/g, " ")
+        .replace(/=([0-9A-Fa-f]{2})/g, (_h, hex) => String.fromCharCode(parseInt(hex, 16)));
+      return Buffer.from(qp, "latin1").toString("utf8");
+    } catch {
+      return text;
+    }
+  });
+}
+
+export interface ThreadHit {
+  thread_key: string; // normalized subject — the stable link ref
+  subject: string;    // newest message's subject (display)
+  from: string;
+  date: string;       // YYYY-MM-DD (INTERNALDATE)
+  count: number;
+}
+
+/**
+ * Search a folder for messages matching the query (SUBJECT/FROM/TEXT),
+ * grouped into threads by normalized subject, newest first. Cap 25.
+ */
+export async function searchThreads(opts: {
+  query: string; folder?: string; config: any;
+}): Promise<ThreadHit[]> {
+  const cfg = resolveConfig(opts.config); // throws human-readable ImapError when missing
+  const q = String(opts.query || "").trim();
+  if (!q) return [];
+  const conn = new Conn();
+  await conn.open(cfg.host, cfg.port);
+  try {
+    const greet = await conn.greeting();
+    if (!/^\* OK/i.test(greet)) throw new ImapError("imap server did not greet");
+    await conn.cmd("t001", `LOGIN ${qstr(cfg.user)} ${qstr(cfg.pass)}`);
+    const folder = opts.folder || cfg.folder || (await findSentFolder(conn));
+    if (!folder) throw new ImapError("imap: could not find a Sent folder");
+    await conn.cmd("t002", `EXAMINE ${qstr(folder)}`); // read-only
+    const ascii = /^[\x00-\x7F]*$/.test(q);
+    const crit = `(OR (OR SUBJECT ${qstr(q)} FROM ${qstr(q)}) TEXT ${qstr(q)})`;
+    const lines = await conn.cmd(
+      "t003", ascii ? `UID SEARCH ${crit}` : `UID SEARCH CHARSET UTF-8 ${crit}`);
+    let uids: string[] = [];
+    for (const l of lines) {
+      const m = l.match(/^\* SEARCH\s*(.*)$/i);
+      if (m && m[1].trim()) uids.push(...m[1].trim().split(/\s+/));
+    }
+    // Newest ~300 only; group into threads, cap 25.
+    uids = uids.slice(-300);
+    const msgs: { subject: string; from: string; internal: string }[] = [];
+    for (let i = 0; i < uids.length; i += 200) {
+      const chunk = uids.slice(i, i + 200);
+      const fl = await conn.cmd(
+        "t004", `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (SUBJECT FROM DATE)])`);
+      for (const l of fl) {
+        const head = l.includes("\n") ? l.slice(0, l.indexOf("\n")) : l;
+        const im = head.match(/INTERNALDATE "([^"]+)"/i);
+        if (!im) continue;
+        // Literal bytes were appended after "\n" by the connection reader.
+        const hdrBlock = l.includes("\n") ? l.slice(l.indexOf("\n") + 1) : "";
+        const unfolded: string[] = [];
+        for (const hl of hdrBlock.replace(/\)\s*$/, "").split(/\r?\n/)) {
+          if (/^[ \t]/.test(hl) && unfolded.length) unfolded[unfolded.length - 1] += " " + hl.trim();
+          else if (hl.trim()) unfolded.push(hl.trim());
+        }
+        const headers: Record<string, string> = {};
+        for (const hl of unfolded) {
+          const c = hl.indexOf(":");
+          if (c > 0) {
+            const k = hl.slice(0, c).toLowerCase();
+            if (!(k in headers)) headers[k] = decodeHeader(hl.slice(c + 1).trim());
+          }
+        }
+        msgs.push({
+          subject: headers.subject || "(no subject)",
+          from: headers.from || "",
+          internal: im[1],
+        });
+      }
+    }
+    const groups = new Map<string, { subject: string; from: string; internal: string; count: number }>();
+    for (const m of msgs) {
+      const key = normalizeSubject(m.subject) || "(no subject)";
+      const g = groups.get(key);
+      if (!g) {
+        groups.set(key, { subject: m.subject, from: m.from, internal: m.internal, count: 1 });
+      } else {
+        g.count++;
+        if (m.internal > g.internal) { g.subject = m.subject; g.from = m.from; g.internal = m.internal; }
+      }
+    }
+    return [...groups.entries()]
+      .map(([thread_key, g]) => ({
+        thread_key,
+        subject: g.subject,
+        from: g.from,
+        date: internalDateToIso(g.internal),
+        count: g.count,
+        _internal: g.internal,
+      }))
+      .sort((a, b) => (a._internal < b._internal ? 1 : -1))
+      .slice(0, 25)
+      .map(({ _internal, ...rest }) => rest);
+  } finally {
+    conn.close();
+  }
+}
+
 class Conn {
   private buf = Buffer.alloc(0);
   private lines: string[] = [];
@@ -220,4 +352,4 @@ export const connector = {
 };
 
 // Exported for tests (pure helpers, no network).
-export const _test = { imapDate, internalDateToIso, resolveConfig };
+export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader };

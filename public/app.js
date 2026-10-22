@@ -92,9 +92,13 @@ function setTab(tab) {
 
 /* ---------- shared render bits ---------- */
 function taskRow(t) {
+  const n = (t.links || []).length;
   return `<div class="task${t.done ? " done" : ""}" data-task="${esc(t.id)}">
     <button class="check" data-toggle="${esc(t.id)}" aria-label="toggle task">${t.done ? "✓" : ""}</button>
     <span class="task-title">${esc(t.title)}</span>
+    <button class="ev${n ? " has" : ""}" data-ev="${esc(t.id)}" aria-label="task evidence" title="Evidence">
+      <span class="ev-ico">🔗</span>${n ? `<span class="ev-n">${n}</span>` : ""}
+    </button>
   </div>`;
 }
 function roleBlocks(roles) {
@@ -126,6 +130,8 @@ function render() {
 }
 
 document.addEventListener("click", async (e) => {
+  const evb = e.target.closest("[data-ev]");
+  if (evb) { evidenceSheet(evb.dataset.ev); return; }
   const t = e.target.closest("[data-toggle]");
   if (t) {
     t.disabled = true;
@@ -348,5 +354,132 @@ async function connSheet(id) {
       state.connectors = await api("/api/connectors");
       closeSheet(); renderKpis();
     } catch (e) { alert(e.message); }
+  }
+}
+
+/* ---------- task evidence ---------- */
+function findTask(taskId) {
+  for (const w of state.dash.weeks)
+    for (const ts of Object.values(w.roles)) {
+      const t = ts.find((x) => x.id === taskId);
+      if (t) return t;
+    }
+  return null;
+}
+
+function metaLine(l) {
+  const m = l.meta || {};
+  const bits = [l.kind];
+  if (m.from) bits.push(m.from);
+  if (m.date) bits.push(m.date);
+  if (m.count) bits.push(m.count + (m.count === 1 ? " message" : " messages"));
+  return bits.join(" · ");
+}
+
+function linkRow(l) {
+  return `<div class="link-row">
+    ${srcBadge(l.source)}
+    <div class="link-body"><b>${esc(l.label)}</b><div class="meta">${esc(metaLine(l))}</div></div>
+    <button class="btn ghost small" data-unlink="${esc(l.id)}">Unlink</button>
+  </div>`;
+}
+
+async function evidenceSheet(taskId) {
+  const task = findTask(taskId);
+  if (!task) return;
+  const links = task.links || [];
+  openSheet(`
+    <h3>Evidence</h3>
+    <p class="meta" style="color:var(--muted);font-size:13px;margin:-6px 0 12px">${esc(task.title)}</p>
+    <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">No linked evidence yet.</div>`}</div>
+    <h3 style="margin-top:20px">Link evidence</h3>
+    <div class="pills" id="ev-src">
+      <button class="pill active" data-evsrc="email">Email</button>
+      <button class="pill" data-evsrc="manual">Manual note</button>
+      <button class="pill" data-evsrc="webhook">Webhook</button>
+    </div>
+    <div id="ev-form"></div>
+    <div class="sheet-actions"><button class="btn ghost" id="f-cancel">Done</button></div>`);
+  $("#f-cancel").onclick = closeSheet;
+  $$("#ev-src [data-evsrc]").forEach((b) => b.addEventListener("click", () => {
+    $$("#ev-src .pill").forEach((x) => x.classList.toggle("active", x === b));
+    evForm(taskId, b.dataset.evsrc);
+  }));
+  evForm(taskId, "email");
+  $$("#ev-list [data-unlink]").forEach((b) => b.addEventListener("click", () =>
+    unlinkEvidence(taskId, b.dataset.unlink)));
+}
+
+async function unlinkEvidence(taskId, linkId) {
+  try {
+    await api(`/api/links/${linkId}`, "DELETE");
+    await loadDash();
+    evidenceSheet(taskId);
+  } catch (e) { alert(e.message); }
+}
+
+async function linkEvidence(taskId, payload) {
+  await api(`/api/runs/${state.runId}/tasks/${taskId}/links`, "POST", payload);
+  await loadDash();
+  evidenceSheet(taskId);
+}
+
+function evForm(taskId, src) {
+  const f = $("#ev-form");
+  if (src === "manual") {
+    f.innerHTML = `<div class="field"><label>Note</label>
+      <textarea id="f-note" rows="2" placeholder="e.g. Signed SOW received from Acme"></textarea></div>
+      <button class="btn" id="f-link">Link note</button>`;
+    $("#f-link").onclick = async () => {
+      const label = $("#f-note").value.trim();
+      if (!label) { alert("Note is required"); return; }
+      try { await linkEvidence(taskId, { source: "manual", kind: "note", label }); }
+      catch (e) { alert(e.message); }
+    };
+  } else if (src === "webhook") {
+    f.innerHTML = `<p class="meta">Generating keys…</p>`;
+    api("/api/connectors/webhook").then((c) => {
+      const keys = Object.entries((c.config && c.config.keys) || {});
+      const hook = keys.length
+        ? `${location.origin}/api/hooks/${keys[0][0]}`
+        : `${location.origin}/api/hooks/:key`;
+      f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Any system can link evidence to this task:</p>
+        <div class="mono" style="margin-bottom:8px">POST ${esc(hook)}</div>
+        <div class="mono">{ "task_id": "${esc(taskId)}", "kind": "record",
+  "ref": "ext-123", "label": "CRM opportunity closed" }</div>
+        ${keys.length ? "" : `<p class="meta" style="color:var(--muted);font-size:13px;margin-top:8px">Generate a key under KPIs → Connectors → Inbound webhook.</p>`}`;
+    }).catch((e) => { f.innerHTML = `<p class="meta">${esc(e.message)}</p>`; });
+  } else {
+    f.innerHTML = `<div class="field"><label>Search email threads</label>
+      <input id="f-q" placeholder="e.g. Delivery Kickoff" autocomplete="off"></div>
+      <button class="btn" id="f-search">Search</button>
+      <div id="f-results" style="margin-top:12px"></div>`;
+    const go = async () => {
+      const q = $("#f-q").value.trim();
+      const box = $("#f-results");
+      if (!q) return;
+      box.innerHTML = `<div class="meta">Searching…</div>`;
+      try {
+        const r = await api(`/api/connectors/email-imap/threads?q=${encodeURIComponent(q)}`);
+        if (!r.threads.length) { box.innerHTML = `<div class="meta">No threads found.</div>`; return; }
+        box.innerHTML = r.threads.map((t) => `
+          <div class="thread-row">
+            <div class="thread-body"><b>${esc(t.subject)}</b>
+              <div class="meta">${esc(t.from)} · ${esc(t.date)} · ${t.count} message${t.count === 1 ? "" : "s"}</div></div>
+            <button class="btn ghost small" data-link-thread='${esc(JSON.stringify(t))}'>Link</button>
+          </div>`).join("");
+        $$("#f-results [data-link-thread]").forEach((b) => b.addEventListener("click", async () => {
+          const th = JSON.parse(b.dataset.linkThread);
+          try {
+            await linkEvidence(taskId, {
+              source: "email-imap", kind: "thread", ref: th.thread_key, label: th.subject,
+              meta: { from: th.from, date: th.date, count: th.count },
+            });
+          } catch (e) { alert(e.message); }
+        }));
+      } catch (e) { box.innerHTML = `<div class="meta">${esc(e.message)}</div>`; }
+    };
+    $("#f-search").onclick = go;
+    $("#f-q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   }
 }

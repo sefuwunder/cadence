@@ -54,7 +54,7 @@ or a comment block.
 | id | mode | notes |
 |----|------|-------|
 | `manual` | no-op | Metrics entered by hand; `sync()` returns `[]`. |
-| `email-imap` | poll | Counts Sent-folder messages per day. Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, or `data/imap.json` (gitignored). Read-only. |
+| `email-imap` | poll + thread search | Counts Sent-folder messages per day; also powers email-thread evidence linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, or `data/imap.json` (gitignored). Read-only. |
 | `webhook` | inbound | External systems `POST /api/hooks/:key` with `{kpi_id, date, value, note}`. Keys live in its connector config: `{keys: {"<uuid>": {"label": "..."}}}`. `sync()` is a no-op. |
 
 ## Testing a new connector

@@ -24,12 +24,19 @@ export function initDb(db: Database) {
     id TEXT PRIMARY KEY, kpi_id TEXT NOT NULL, date TEXT NOT NULL,
     value REAL NOT NULL, source TEXT NOT NULL DEFAULT 'manual', note TEXT NOT NULL DEFAULT ''
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS task_links (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual',
+    kind TEXT NOT NULL DEFAULT 'note', ref TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '', meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT ''
+  )`);
   db.run(`CREATE TABLE IF NOT EXISTS connector_cfg (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}'
   )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_kpis_run ON kpis(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_entries_kpi ON metric_entries(kpi_id, date)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_links_task ON task_links(task_id)`);
 }
 
 /** Seed the template playbook on a fresh database. Idempotent. */
