@@ -96,7 +96,7 @@ function taskRow(t) {
   return `<div class="task${t.done ? " done" : ""}" data-task="${esc(t.id)}">
     <button class="check" data-toggle="${esc(t.id)}" aria-label="toggle task">${t.done ? "✓" : ""}</button>
     <span class="task-title">${esc(t.title)}</span>
-    <button class="ev${n ? " has" : ""}" data-ev="${esc(t.id)}" aria-label="task evidence" title="Evidence">
+    <button class="ev${n ? " has" : ""}" data-ev="${esc(t.id)}" aria-label="task feed" title="Feed">
       <span class="ev-ico">🔗</span>${n ? `<span class="ev-n">${n}</span>` : ""}
     </button>
   </div>`;
@@ -131,7 +131,7 @@ function render() {
 
 document.addEventListener("click", async (e) => {
   const evb = e.target.closest("[data-ev]");
-  if (evb) { evidenceSheet(evb.dataset.ev); return; }
+  if (evb) { feedSheet(evb.dataset.ev); return; }
   const t = e.target.closest("[data-toggle]");
   if (t) {
     t.disabled = true;
@@ -233,7 +233,7 @@ function renderActivity() {
     : `<div class="feed-item"><span class="feed-dot metric"></span><div class="feed-body">
          ${srcBadge(a.source)} <b>${esc(a.kpi)}</b>: ${a.value} ${esc(a.unit)}${a.note ? ` — ${esc(a.note)}` : ""}
          <div class="feed-when">${esc(a.date || a.at)}</div></div></div>`).join("");
-  $("#view-activity").innerHTML = `<h2>Activity</h2><p class="sub">Evidence feed — completions and metric entries</p>
+  $("#view-activity").innerHTML = `<h2>Activity</h2><p class="sub">Completions and metric entries across all tasks</p>
     <div class="card" style="padding:8px 16px">${items || `<div class="empty" style="padding:24px">Nothing yet.</div>`}</div>`;
 }
 
@@ -383,7 +383,7 @@ async function connSheet(id) {
   }
 }
 
-/* ---------- task evidence ---------- */
+/* ---------- task feed ---------- */
 function findTask(taskId) {
   for (const w of state.dash.weeks)
     for (const ts of Object.values(w.roles)) {
@@ -406,19 +406,19 @@ function linkRow(l) {
   return `<div class="link-row">
     ${srcBadge(l.source)}
     <div class="link-body"><b>${esc(l.label)}</b><div class="meta">${esc(metaLine(l))}</div></div>
-    <button class="btn ghost small" data-unlink="${esc(l.id)}">Unlink</button>
+    <button class="btn ghost small" data-unlink="${esc(l.id)}">Remove</button>
   </div>`;
 }
 
-async function evidenceSheet(taskId) {
+async function feedSheet(taskId) {
   const task = findTask(taskId);
   if (!task) return;
   const links = task.links || [];
   openSheet(`
-    <h3>Evidence</h3>
+    <h3>Feed</h3>
     <p class="meta" style="color:var(--muted);font-size:13px;margin:-6px 0 12px">${esc(task.title)}</p>
-    <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">No linked evidence yet.</div>`}</div>
-    <h3 style="margin-top:20px">Link evidence</h3>
+    <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">Nothing in the feed yet.</div>`}</div>
+    <h3 style="margin-top:20px">Add to feed</h3>
     <div class="pills" id="ev-src">
       <button class="pill active" data-evsrc="email">Email</button>
       <button class="pill" data-evsrc="manual">Manual note</button>
@@ -433,21 +433,21 @@ async function evidenceSheet(taskId) {
   }));
   evForm(taskId, "email");
   $$("#ev-list [data-unlink]").forEach((b) => b.addEventListener("click", () =>
-    unlinkEvidence(taskId, b.dataset.unlink)));
+    removeFromFeed(taskId, b.dataset.unlink)));
 }
 
-async function unlinkEvidence(taskId, linkId) {
+async function removeFromFeed(taskId, linkId) {
   try {
     await api(`/api/links/${linkId}`, "DELETE");
     await loadDash();
-    evidenceSheet(taskId);
+    feedSheet(taskId);
   } catch (e) { alert(e.message); }
 }
 
-async function linkEvidence(taskId, payload) {
+async function addToFeed(taskId, payload) {
   await api(`/api/runs/${state.runId}/tasks/${taskId}/links`, "POST", payload);
   await loadDash();
-  evidenceSheet(taskId);
+  feedSheet(taskId);
 }
 
 function evForm(taskId, src) {
@@ -455,11 +455,11 @@ function evForm(taskId, src) {
   if (src === "manual") {
     f.innerHTML = `<div class="field"><label>Note</label>
       <textarea id="f-note" rows="2" placeholder="e.g. Signed SOW received from Acme"></textarea></div>
-      <button class="btn" id="f-link">Link note</button>`;
+      <button class="btn" id="f-link">Add note</button>`;
     $("#f-link").onclick = async () => {
       const label = $("#f-note").value.trim();
       if (!label) { alert("Note is required"); return; }
-      try { await linkEvidence(taskId, { source: "manual", kind: "note", label }); }
+      try { await addToFeed(taskId, { source: "manual", kind: "note", label }); }
       catch (e) { alert(e.message); }
     };
   } else if (src === "webhook") {
@@ -469,7 +469,7 @@ function evForm(taskId, src) {
       const hook = keys.length
         ? `${location.origin}/api/hooks/${keys[0][0]}`
         : `${location.origin}/api/hooks/:key`;
-      f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Any system can link evidence to this task:</p>
+      f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Any system can post to this task\u2019s feed:</p>
         <div class="mono" style="margin-bottom:8px">POST ${esc(hook)}</div>
         <div class="mono">{ "task_id": "${esc(taskId)}", "kind": "record",
   "ref": "ext-123", "label": "CRM opportunity closed" }</div>
@@ -492,12 +492,12 @@ function evForm(taskId, src) {
           <div class="thread-row">
             <div class="thread-body"><b>${esc(t.subject)}</b>
               <div class="meta">${esc(t.from)} · ${esc(t.date)} · ${t.count} message${t.count === 1 ? "" : "s"}</div></div>
-            <button class="btn ghost small" data-link-thread='${esc(JSON.stringify(t))}'>Link</button>
+            <button class="btn ghost small" data-link-thread='${esc(JSON.stringify(t))}'>Add</button>
           </div>`).join("");
         $$("#f-results [data-link-thread]").forEach((b) => b.addEventListener("click", async () => {
           const th = JSON.parse(b.dataset.linkThread);
           try {
-            await linkEvidence(taskId, {
+            await addToFeed(taskId, {
               source: "email-imap", kind: "thread", ref: th.thread_key, label: th.subject,
               meta: { from: th.from, date: th.date, count: th.count },
             });

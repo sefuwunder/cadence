@@ -2,7 +2,7 @@
 
 A C-suite playbook execution tracker. Run 30-day execution playbooks (sales sprints,
 product launches, operating cadences): weekly task checklists per role (CEO / CRO /
-CTO / COO), KPI targets vs actuals, and an evidence feed — with actuals fed by an
+CTO / COO), KPI targets vs actuals, and a per-task feed — with actuals fed by an
 extensible connector framework (manual entry, email, webhooks, …).
 
 Bun + zero npm dependencies + SQLite. Binds `127.0.0.1` only. Mobile-first UI that
@@ -28,12 +28,12 @@ Hit **+** in the top bar to start a run from it.
 - **Playbook** — week selector (W1–W4), role swimlanes with completion counts.
 - **KPIs** — cards with per-week target/actual bars, manual log, per-connector sync,
   and a Connectors section for setup.
-- **Activity** — evidence feed: task completions + metric entries with source badges.
+- **Activity** — feed: task completions + metric entries with source badges.
 
-## Task evidence
+## Task feed
 
 Any source of truth can be mapped to an individual playbook task: tap the 🔗 on a
-task row to open its evidence sheet — linked items (email threads, manual notes,
+task row to open its feed — linked items (email threads, manual notes,
 webhook records) with source badges, plus unlink buttons.
 
 - **Email threads** — search your mail by subject/from/text; results are grouped
@@ -42,7 +42,7 @@ webhook records) with source badges, plus unlink buttons.
   subject, meta carries from/date/message count). One row per thread, manual
   linking only (no auto-rules in v1).
 - **Manual note** — free-text note linked as `source: manual, kind: note`.
-- **Webhook** — any system can link evidence: `POST /api/hooks/:key`
+- **Webhook** — any system can post to a task’s feed: `POST /api/hooks/:key`
   `{ "task_id", "kind", "ref", "label", "meta"? }`.
 
 `task_links` table: `id, task_id, source, kind, ref, label, meta_json, created_at`.
