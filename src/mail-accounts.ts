@@ -150,6 +150,13 @@ export async function resolveSmtpForAccount(
   return { cfg, account };
 }
 
+/** The user's own addresses (every sending account) — never harvested as
+ *  contacts and never shown as stakeholders. Lowercased. */
+export async function ownEmails(db: any): Promise<Set<string>> {
+  const { accounts } = await listSendAccounts(db).catch(() => ({ accounts: [] as MailAccount[] }));
+  return new Set(accounts.map((a) => a.email.toLowerCase()));
+}
+
 /** IMAP config override so the sent message is filed in the SENDING
  *  account's Sent folder (best-effort; failures are non-fatal upstream). */
 export function imapConfigForAccount(db: any, account: MailAccount): any {

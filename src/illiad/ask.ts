@@ -7,6 +7,7 @@ import { parseIntent, matchKpiName, matchTask } from "./intents.ts";
 import { analyzeRun, fmt, whole } from "./analyze.ts";
 import { composeBrief, composeEncouragement } from "./brief.ts";
 import { getDashboard, getStakeholders, syncRunFeeds } from "../server.ts";
+import { ownEmails } from "../mail-accounts.ts";
 
 const HELP = `I'm Illiad — I automate, analyze, and keep the state of play positive.
 
@@ -135,7 +136,7 @@ export async function askIlliad(
 
     case "stakeholder": {
       const who = (parsed.slots.who || "").trim().toLowerCase();
-      const sh = getStakeholders(db, opts.runId);
+      const sh = getStakeholders(db, opts.runId, await ownEmails(db));
       const hits = sh.filter((s: any) =>
         s.name.toLowerCase().includes(who) || s.email.toLowerCase().includes(who));
       if (!hits.length) {

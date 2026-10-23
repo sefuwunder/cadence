@@ -14,7 +14,7 @@ import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
 import { getContactPhoto, syncPhotosFromEDS } from "./contacts.ts";
-import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig } from "./mail-accounts.ts";
+import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig, ownEmails } from "./mail-accounts.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -115,7 +115,7 @@ export function parseAddr(s: any): { email: string; name: string } | null {
 
 /** Harvest raw address strings ("Name <email>" or bare) into email_contacts.
  *  Keeps the first-seen name; always refreshes last_used. */
-export function harvestContacts(db: Database, addrs: any[]) {
+export function harvestContacts(db: Database, addrs: any[], exclude?: Set<string>) {
   const now = new Date().toISOString();
   const up = db.prepare(
     "INSERT INTO email_contacts (email, name, last_used) VALUES (?, ?, ?) " +
@@ -124,17 +124,25 @@ export function harvestContacts(db: Database, addrs: any[]) {
   const run = db.transaction((list: any[]) => {
     for (const a of list) {
       const p = parseAddr(a);
-      if (p) up.run(p.email, p.name, now);
+      if (!p) continue;
+      if (exclude?.has(p.email)) continue; // never harvest the user's own addresses
+      up.run(p.email, p.name, now);
     }
   });
   run(addrs || []);
+  // Self-healing: own addresses harvested in the past are not contacts.
+  if (exclude && exclude.size) {
+    const del = db.prepare("DELETE FROM email_contacts WHERE email = ?");
+    const clean = db.transaction((emails: string[]) => { for (const e of emails) del.run(e); });
+    clean([...exclude]);
+  }
 }
 
 // ---------- stakeholders ----------
 // Per-counterparty rollup: threads + tasks involving each email address,
 // built from email_contacts and thread-link meta (from/to). Exported so
 // Illiad can answer "how's acme?" against the same data as the People tab.
-export function getStakeholders(db: Database, runId: string): any[] {
+export function getStakeholders(db: Database, runId: string, exclude?: Set<string>): any[] {
   const tasks: any[] = db.query(
     "SELECT id, title, role, week FROM tasks WHERE run_id = ?").all(runId);
   const tById = new Map(tasks.map((t) => [t.id, t]));
@@ -147,6 +155,7 @@ export function getStakeholders(db: Database, runId: string): any[] {
   const sh = new Map<string, any>();
   const touch = (email: string, name: string, link: any, meta: any) => {
     email = email.toLowerCase();
+    if (exclude?.has(email)) return; // the user is not their own stakeholder
     if (!sh.has(email)) {
       sh.set(email, { email, name, last_used: "", threads: [], taskIds: new Set<string>() });
     }
@@ -173,6 +182,7 @@ export function getStakeholders(db: Database, runId: string): any[] {
   }
   for (const c of contacts) {
     const email = String(c.email).toLowerCase();
+    if (exclude?.has(email)) continue;
     if (!sh.has(email)) {
       sh.set(email, { email, name: c.name || "", last_used: c.last_used || "", threads: [], taskIds: new Set() });
     } else if (c.name && !sh.get(email).name) {
@@ -214,6 +224,7 @@ export async function syncRunFeeds(
   const batch = links.slice(0, 20); // cap: most-recently-active first
   const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
   const config = row ? JSON.parse(row.config_json) : {};
+  const own = await ownEmails(db); // never harvest the user's own addresses
   let synced = 0, newReplies = 0, firstErr = "";
   for (const l of batch) {
     try {
@@ -222,7 +233,7 @@ export async function syncRunFeeds(
         config, fetchMessages: threadFetcher,
       });
       db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify(r.meta), l.id]);
-      harvestContacts(db, r.harvest);
+      harvestContacts(db, r.harvest, own);
       synced++; newReplies += r.newCount;
     } catch (e: any) { if (!firstErr) firstErr = e?.message || "thread sync failed"; }
   }
@@ -354,6 +365,11 @@ export function createApp(opts: {
     const url = new URL(req.url);
     const path = url.pathname;
     const m = req.method;
+
+    // Own addresses (every sending account), memoized per request: never
+    // harvested as contacts, never shown as stakeholders.
+    let ownCache: Set<string> | null = null;
+    const ownAddrs = async (): Promise<Set<string>> => (ownCache ??= await ownEmails(db));
 
     try {
       // ----- playbooks -----
@@ -488,10 +504,11 @@ export function createApp(opts: {
           "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 500),
            JSON.stringify(meta), new Date().toISOString()]);
-        // Harvest contacts from linked email threads (from + recipients).
+        // Harvest contacts from linked email threads (from + recipients),
+        // never the user's own addresses.
         if (source === "email-imap") {
           const tos = Array.isArray(meta.to) ? meta.to : [];
-          harvestContacts(db, [meta.from, meta.last_from, ...tos]);
+          harvestContacts(db, [meta.from, meta.last_from, ...tos], await ownAddrs());
         }
         return json({ id }, 201);
       }
@@ -514,7 +531,7 @@ export function createApp(opts: {
           config, fetchMessages: opts.threadFetcher,
         });
         db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify(r.meta), l.id]);
-        harvestContacts(db, r.harvest);
+        harvestContacts(db, r.harvest, await ownAddrs());
         return r;
       };
       const threadLinksForTask = (taskId: string) => db.query(
@@ -570,7 +587,7 @@ export function createApp(opts: {
         if (!runId) return err(400, "run_id is required");
         const run: any = db.query("SELECT id FROM runs WHERE id = ?").get(runId);
         if (!run) return err(404, "run not found");
-        return json({ stakeholders: getStakeholders(db, runId) });
+        return json({ stakeholders: getStakeholders(db, runId, await ownAddrs()) });
       }
 
       // ----- illiad -----

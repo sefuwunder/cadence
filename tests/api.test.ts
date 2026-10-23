@@ -3,7 +3,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { createApp, STALL_DAYS, stallStatus, parseAddr, harvestContacts, syncRunFeeds } from "../src/server.ts";
+import { createApp, STALL_DAYS, stallStatus, parseAddr, harvestContacts, getStakeholders, syncRunFeeds } from "../src/server.ts";
 import { connectors } from "../src/connectors/index.ts";
 import { _test as imapTest, syncThread } from "../src/connectors/email-imap.ts";
 import { _test as calTest } from "../src/connectors/calendar-ical.ts";
@@ -530,6 +530,33 @@ describe("contact harvesting", () => {
     expect(found.get("jane@acme.com")).toBe("Jane Doe");
     harvestContacts(app.db, ["not-an-email", "", null, "  "]);
     expect(contacts().some((c: any) => c.email === "not-an-email")).toBe(false);
+  });
+
+  test("own sending addresses are never harvested or listed as stakeholders", async () => {
+    const m = await import("../src/mail-accounts.ts");
+    const add = await call("POST", "/api/email-accounts", { action: "add",
+      account: { email: "me@self.com", smtp_host: "smtp.example.com", smtp_user: "me@self.com", smtp_pass: "pw" } });
+    expect(add.status).toBe(201);
+    const own = await m.ownEmails(app.db);
+    expect(own.has("me@self.com")).toBe(true);
+    // Pre-existing own row gets cleaned on the next harvest (self-healing).
+    app.db.run("INSERT INTO email_contacts (email, name, last_used) VALUES ('me@self.com', '', ?)",
+      [new Date().toISOString()]);
+    const t: any = (await call("GET", `/api/runs/${runId}`)).data.weeks[0].roles.CEO[0];
+    const r = await call("POST", `/api/runs/${runId}/tasks/${t.id}/links`, {
+      source: "email-imap", kind: "thread", ref: "own harvest", label: "Own Harvest",
+      meta: { from: "me@self.com", to: ["client@acme.com"], date: "2026-10-22" },
+    });
+    expect(r.status).toBe(201);
+    const emails = app.db.query("SELECT email FROM email_contacts").all().map((x: any) => x.email);
+    expect(emails).not.toContain("me@self.com"); // own address skipped + cleaned
+    expect(emails).toContain("client@acme.com");  // the recipient IS harvested
+    // Stakeholder rollup: the user is not their own stakeholder.
+    const sh = getStakeholders(app.db, runId, own);
+    expect(sh.some((s: any) => s.email === "me@self.com")).toBe(false);
+    expect(sh.some((s: any) => s.email === "client@acme.com")).toBe(true);
+    await call("DELETE", `/api/links/${r.data.id}`);
+    await call("POST", "/api/email-accounts", { action: "remove", id: add.data.id });
   });
 
   test("syncThread returns harvest addresses (seed + fresh)", async () => {

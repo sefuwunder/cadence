@@ -95,7 +95,9 @@ under "Needs attention". Pure date math, no AI.
 `email_contacts` + thread-link meta (`from`/`to`): `[{email, name, last_used,
 threads: [{task_id, task_title, subject, last_date, unseen}],
 tasks: [{task_id, title, role, week}]}]`, sorted by recency (thread count, then
-email, break ties).
+email, break ties). The user's own sending addresses are never harvested as
+contacts and never appear as stakeholders (pre-existing own-address rows are
+cleaned on the next harvest).
 
 ## Illiad
 
