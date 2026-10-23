@@ -1631,3 +1631,19 @@ describe("manual contact photos", () => {
     expect(r.status).toBe(200);
   });
 });
+
+describe("splitAddrList", () => {
+  test("splits simple and named addresses", () => {
+    expect(imapTest.splitAddrList("Jane Doe <jane@acme.com>, bob@acme.com"))
+      .toEqual(["Jane Doe <jane@acme.com>", "bob@acme.com"]);
+  });
+  test("respects quoted commas and angle brackets", () => {
+    expect(imapTest.splitAddrList('"Doe, Jane" <jane@acme.com>, bob@acme.com'))
+      .toEqual(['"Doe, Jane" <jane@acme.com>', "bob@acme.com"]);
+  });
+  test("empty / junk", () => {
+    expect(imapTest.splitAddrList("")).toEqual([]);
+    expect(imapTest.splitAddrList("  , ,")).toEqual([]);
+    expect(imapTest.splitAddrList(null as any)).toEqual([]);
+  });
+});

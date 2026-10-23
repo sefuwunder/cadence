@@ -47,7 +47,8 @@ webhook records) with source badges, plus unlink buttons.
 - **Email threads** — search your mail by subject/from/text; results are grouped
   into threads by normalized subject (Re:/Fwd:/[tags] stripped, case-insensitive —
   no JWZ). Linking a thread stores one row (`kind: thread`, ref = the normalized
-  subject, meta carries from/date/message count). One row per thread, manual
+  subject, meta carries from/to/date/message count). Recipients are harvested
+  as contacts on link (your own addresses never are). One row per thread, manual
   linking only (no auto-rules in v1).
 - **Inbound reply ingestion** — the feed sheet has a **Sync** button that pulls
   replies into each linked thread: IMAP SUBJECT-searches INBOX + Sent, diffs

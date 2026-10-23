@@ -953,7 +953,7 @@ function evForm(taskId, src) {
         box.innerHTML = r.threads.map((t) => `
           <div class="thread-row">
             <div class="thread-body"><b>${esc(t.subject)}</b>
-              <div class="meta">${esc(t.from)} · ${esc(t.date)} · ${t.count} message${t.count === 1 ? "" : "s"}</div></div>
+              <div class="meta">${esc(t.from)}${t.to && t.to.length ? ` → ${esc(t.to[0])}${t.to.length > 1 ? ` +${t.to.length - 1}` : ""}` : ""} · ${esc(t.date)} · ${t.count} message${t.count === 1 ? "" : "s"}</div></div>
             <button class="btn ghost small" data-link-thread='${esc(JSON.stringify(t))}'>Add</button>
           </div>`).join("");
         $$("#f-results [data-link-thread]").forEach((b) => b.addEventListener("click", async () => {
@@ -961,7 +961,7 @@ function evForm(taskId, src) {
           try {
             await addToFeed(taskId, {
               source: "email-imap", kind: "thread", ref: th.thread_key, label: th.subject,
-              meta: { from: th.from, date: th.date, count: th.count },
+              meta: { from: th.from, to: th.to || [], date: th.date, count: th.count },
             });
           } catch (e) { alert(e.message); }
         }));

@@ -80,8 +80,25 @@ export interface ThreadHit {
   thread_key: string; // normalized subject — the stable link ref
   subject: string;    // newest message's subject (display)
   from: string;
+  to: string[];       // deduped recipient addr-specs across the thread
   date: string;       // YYYY-MM-DD (INTERNALDATE)
   count: number;
+}
+
+/** Split a To/Cc header into individual addr-specs ("Name <email>" or bare),
+ *  respecting quoted commas and angle brackets. */
+export function splitAddrList(header: string): string[] {
+  const parts: string[] = [];
+  let cur = "", depth = 0, inQ = false;
+  for (const ch of String(header || "")) {
+    if (ch === '"') inQ = !inQ;
+    else if (!inQ && ch === "<") depth++;
+    else if (!inQ && ch === ">") depth = Math.max(0, depth - 1);
+    if (ch === "," && !inQ && depth === 0) { parts.push(cur); cur = ""; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts.map((p) => p.trim()).filter(Boolean);
 }
 
 /** SASL XOAUTH2 initial client response: base64("user=<email>\x01auth=Bearer <token>\x01\x01"). */
@@ -119,11 +136,11 @@ export async function searchThreads(opts: {
     }
     // Newest ~300 only; group into threads, cap 25.
     uids = uids.slice(-300);
-    const msgs: { subject: string; from: string; internal: string }[] = [];
+    const msgs: { subject: string; from: string; to: string[]; internal: string }[] = [];
     for (let i = 0; i < uids.length; i += 200) {
       const chunk = uids.slice(i, i + 200);
       const fl = await conn.cmd(
-        "t004", `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (SUBJECT FROM DATE)])`);
+        "t004", `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (SUBJECT FROM TO DATE)])`);
       for (const l of fl) {
         const head = l.includes("\n") ? l.slice(0, l.indexOf("\n")) : l;
         const im = head.match(/INTERNALDATE "([^"]+)"/i);
@@ -146,19 +163,23 @@ export async function searchThreads(opts: {
         msgs.push({
           subject: headers.subject || "(no subject)",
           from: headers.from || "",
+          to: splitAddrList(headers.to || ""),
           internal: im[1],
         });
       }
     }
-    const groups = new Map<string, { subject: string; from: string; internal: string; count: number }>();
+    const groups = new Map<string, { subject: string; from: string; to: string[]; internal: string; count: number }>();
     for (const m of msgs) {
       const key = normalizeSubject(m.subject) || "(no subject)";
       const g = groups.get(key);
       if (!g) {
-        groups.set(key, { subject: m.subject, from: m.from, internal: m.internal, count: 1 });
+        groups.set(key, { subject: m.subject, from: m.from, to: [...m.to], internal: m.internal, count: 1 });
       } else {
         g.count++;
         if (m.internal > g.internal) { g.subject = m.subject; g.from = m.from; g.internal = m.internal; }
+        for (const t of m.to) {
+          if (!g.to.some((x) => x.toLowerCase() === t.toLowerCase())) g.to.push(t);
+        }
       }
     }
     return [...groups.entries()]
@@ -166,6 +187,7 @@ export async function searchThreads(opts: {
         thread_key,
         subject: g.subject,
         from: g.from,
+        to: g.to,
         date: internalDateToIso(g.internal),
         count: g.count,
         _internal: g.internal,
@@ -621,7 +643,7 @@ export const connector = {
 };
 
 // Exported for tests (pure helpers, no network).
-export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob, parseThreadFetch };
+export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob, parseThreadFetch, splitAddrList };
 
 /** APPEND a raw RFC 5322 message to the Sent folder (files a sent message so
  *  it shows up in sent-mail and in later thread searches). Read-write, unlike
