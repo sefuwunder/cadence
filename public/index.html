@@ -3,14 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=yes">
+<meta name="color-scheme" content="light dark">
 <title>Cadence — Playbook Execution</title>
 <link rel="stylesheet" href="/styles.css">
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("cadence.theme")||"auto"}catch(e){}</script>
 </head>
 <body>
 <div id="app">
   <header id="topbar">
     <div class="brand"><span class="brand-mark">◈</span> Cadence</div>
     <div class="run-picker">
+      <button id="btn-theme" class="btn ghost theme-btn" data-theme-cycle title="Theme: auto — tap to change" aria-label="Theme: auto — tap to change">◐</button>
       <select id="run-select" aria-label="Select playbook run"></select>
       <button id="btn-new-run" class="btn ghost" title="Start a new run">＋</button>
     </div>

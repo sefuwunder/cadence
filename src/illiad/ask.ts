@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import { parseIntent, matchKpiName, matchTask } from "./intents.ts";
 import { analyzeRun, fmt, whole } from "./analyze.ts";
 import { composeBrief, composeEncouragement } from "./brief.ts";
-import { getDashboard, getStakeholders, syncRunFeeds } from "../server.ts";
+import { getDashboard, getStakeholders, syncRunFeeds, logEvent } from "../server.ts";
 import { ownEmails } from "../mail-accounts.ts";
 
 const HELP = `I'm Illiad — I automate, analyze, and keep the state of play positive.
@@ -179,6 +179,9 @@ export async function askIlliad(
       db.run(
         "INSERT INTO metric_entries (id, kpi_id, date, value, source, note) VALUES (?, ?, ?, ?, 'illiad', '')",
         [crypto.randomUUID(), k.id, today(), value]);
+      logEvent(db, opts.runId, "kpi",
+        `logged ${fmt(value)}${k.unit ? ` ${k.unit}` : ""} for ${match} (via Illiad)`,
+        { kpi_id: k.id });
       const d2 = getDashboard(db, opts.runId);
       const k2 = d2.kpis.find((x: any) => x.name === match);
       const w = d2.current_week - 1;
@@ -210,6 +213,7 @@ export async function askIlliad(
       }
       db.run("UPDATE tasks SET done = 1, done_at = ? WHERE id = ?",
         [new Date().toISOString(), t.id]);
+      logEvent(db, opts.runId, "task", `marked “${t.title}” done (via Illiad)`, { task_id: t.id });
       return { reply: `Done — "${t.title}" marked complete.`, intent: "done" };
     }
 
@@ -224,8 +228,11 @@ export async function askIlliad(
           intent: "create_task",
         };
       }
+      const newId = crypto.randomUUID();
       db.run("INSERT INTO tasks (id, run_id, week, role, title, done) VALUES (?, ?, ?, ?, ?, 0)",
-        [crypto.randomUUID(), opts.runId, week, role, title]);
+        [newId, opts.runId, week, role, title]);
+      logEvent(db, opts.runId, "task",
+        `added task “${title}” to week ${week} for ${role} (via Illiad)`, { task_id: newId });
       return {
         reply: `Added "${title}" to week ${week} for ${role}.`,
         intent: "create_task",

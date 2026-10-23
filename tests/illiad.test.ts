@@ -7,6 +7,7 @@ import { createApp } from "../src/server.ts";
 import { parseIntent, matchKpiName, matchTask } from "../src/illiad/intents.ts";
 import { kpiPacing, analyzeRun } from "../src/illiad/analyze.ts";
 import { composeBrief, composeEncouragement, daypart } from "../src/illiad/brief.ts";
+import { nudgeList } from "../src/illiad/nudges.ts";
 
 const KPI_NAMES = ["Outbound Emails/DMs", "Discovery Calls", "SQLs", "Closed Packages", "Active Seats"];
 
@@ -368,5 +369,81 @@ describe("POST /api/illiad/ask", () => {
     expect(res.status).toBe(404);
     app2.close();
     rmSync(tmp2, { recursive: true, force: true });
+  });
+});
+
+describe("nudgeList", () => {
+  const NOW = new Date("2026-10-23T12:00:00Z").getTime();
+  const dashFor = (over: any = {}) => ({
+    run: { id: "r1", name: "Sprint", start_date: "2026-10-19" },
+    current_week: 1,
+    weeks: [{ week: 1, roles: { CEO: [] as any[] } }],
+    kpis: [],
+    overall: { tasks_done: 0, tasks_total: 0, pct: 0 },
+    ...over,
+  });
+  const task = (over: any = {}) => ({
+    id: "t1", title: "Quiet task", done: false, done_at: null,
+    links: [], unread: false, stalled: false, days_quiet: null, ...over,
+  });
+
+  test("stalled task → check-in nudge with task_id", () => {
+    const t = task({
+      stalled: true, days_quiet: 9,
+      links: [{ source: "manual", kind: "note", meta: {}, created_at: "2026-10-10T00:00:00Z" }],
+    });
+    const n = nudgeList(dashFor({ weeks: [{ week: 1, roles: { CEO: [t] } }] }), NOW);
+    expect(n.length).toBe(1);
+    expect(n[0].kind).toBe("stalled");
+    expect(n[0].task_id).toBe("t1");
+    expect(n[0].text).toContain("Quiet task");
+    expect(n[0].text).toContain("9d");
+  });
+
+  test("behind KPI → pacing nudge", () => {
+    const d = dashFor({
+      kpis: [{ id: "k1", name: "SQLs", unit: "", targets: [20, 0, 0, 0], actuals: [2, 0, 0, 0] }],
+    });
+    const n = nudgeList(d, NOW);
+    const p = n.find((x) => x.kind === "pacing");
+    expect(p).toBeDefined();
+    expect(p!.text).toContain("SQLs");
+    expect(p!.text).toContain("back on pace");
+  });
+
+  test("unread thread → reply nudge", () => {
+    const t = task({
+      unread: true,
+      links: [{ source: "email-imap", kind: "thread", label: "Re: Terms",
+                meta: { unseen: 3, last_from: "a@b.co" }, created_at: "2026-10-23T10:00:00Z" }],
+    });
+    const n = nudgeList(dashFor({ weeks: [{ week: 1, roles: { CEO: [t] } }] }), NOW);
+    const u = n.find((x) => x.kind === "unread");
+    expect(u).toBeDefined();
+    expect(u!.text).toContain("3 unread replies");
+    expect(u!.text).toContain("Re: Terms");
+  });
+
+  test("accelerating completions → momentum nudge", () => {
+    const t1 = task({ id: "a", title: "A", done: true, done_at: "2026-10-22T10:00:00Z" });
+    const t2 = task({ id: "b", title: "B", done: true, done_at: "2026-10-21T10:00:00Z" });
+    const n = nudgeList(dashFor({ weeks: [{ week: 1, roles: { CEO: [t1, t2] } }] }), NOW);
+    const m = n.find((x) => x.kind === "momentum");
+    expect(m).toBeDefined();
+    expect(m!.text).toContain("accelerating");
+  });
+
+  test("quiet board → no nudges", () => {
+    expect(nudgeList(dashFor(), NOW)).toEqual([]);
+  });
+
+  test("at most 4 nudges", () => {
+    const mk = (i: number) => task({
+      id: `s${i}`, title: `Stalled ${i}`, stalled: true, days_quiet: 5 + i,
+      links: [{ source: "manual", kind: "note", meta: {}, created_at: "2026-10-01T00:00:00Z" }],
+    });
+    const n = nudgeList(
+      dashFor({ weeks: [{ week: 1, roles: { CEO: [mk(1), mk(2), mk(3)] } }] }), NOW);
+    expect(n.length).toBeLessThanOrEqual(4);
   });
 });

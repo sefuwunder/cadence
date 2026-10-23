@@ -47,6 +47,14 @@ export function initDb(db: Database) {
   if (!photoCols.includes("source")) {
     db.run(`ALTER TABLE contact_photos ADD COLUMN source TEXT NOT NULL DEFAULT 'eds'`);
   }
+  // Mundane activity log — small user-initiated actions surfaced in the
+  // Activity pane ("added manual note to …"). One row per action, newest first.
+  db.run(`CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '', detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT ''
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, created_at DESC)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_kpis_run ON kpis(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_entries_kpi ON metric_entries(kpi_id, date)`);

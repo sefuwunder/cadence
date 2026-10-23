@@ -31,6 +31,38 @@ const TABS = [
   ["people", "◍", "People"],
 ];
 
+/* ---------- theme: auto (follows the OS) / light / dark ---------- */
+const THEMES = ["auto", "light", "dark"];
+const THEME_ICON = { auto: "◐", light: "☀", dark: "☾" };
+const THEME_TINT = { auto: "", light: "#f2f2f7", dark: "#16161d" };
+function currentTheme() { return localStorage.getItem("cadence.theme") || "auto"; }
+function applyTheme() {
+  const t = currentTheme();
+  document.documentElement.dataset.theme = t;
+  let meta = document.querySelector('meta[name="theme-color"]');
+  if (!meta) {
+    meta = document.createElement("meta");
+    meta.name = "theme-color";
+    document.head.appendChild(meta);
+  }
+  // Auto: let the OS pick the tint via the color-scheme meta; otherwise set it.
+  if (t !== "auto") meta.content = THEME_TINT[t];
+  else meta.removeAttribute("content");
+  $$("[data-theme-cycle]").forEach((b) => {
+    b.textContent = THEME_ICON[t];
+    b.title = `Theme: ${t} — tap to change`;
+    b.setAttribute("aria-label", `Theme: ${t} — tap to change`);
+  });
+}
+function cycleTheme() {
+  const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
+  localStorage.setItem("cadence.theme", next);
+  applyTheme();
+}
+document.addEventListener("click", (e) => {
+  if (e.target.closest("[data-theme-cycle]")) cycleTheme();
+});
+
 /* ---------- sheet ---------- */
 function openSheet(html) {
   $("#sheet-body").innerHTML = html;
@@ -45,6 +77,7 @@ $("#sheet-backdrop").addEventListener("click", closeSheet);
 
 /* ---------- boot ---------- */
 async function boot() {
+  applyTheme(); // before first paint where possible
   // side nav tabs
   $("#side-tabs").innerHTML = TABS.map(([id, ico, label]) =>
     `<button data-tab="${id}" class="tab${id === "today" ? " active" : ""}"><span class="tab-ico">${ico}</span><span>${label}</span></button>`).join("");
@@ -185,7 +218,11 @@ document.addEventListener("keydown", (e) => {
 function renderSideFoot() {
   const o = state.dash.overall;
   $("#side-overall").innerHTML =
-    `<div><b style="color:var(--gold)">${o.pct}%</b> complete · ${o.tasks_done}/${o.tasks_total} tasks · week ${state.dash.current_week}</div>`;
+    `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <div><b style="color:var(--gold)">${o.pct}%</b> complete · ${o.tasks_done}/${o.tasks_total} tasks · week ${state.dash.current_week}</div>
+      <button class="btn ghost small theme-btn" data-theme-cycle title="Theme: auto — tap to change" aria-label="Theme: auto — tap to change">◐</button>
+    </div>`;
+  applyTheme(); // refresh the button's icon for the current theme
 }
 
 function renderEmpty() {
@@ -276,16 +313,36 @@ function renderKpis() {
   $$("#view-kpis [data-conn]").forEach((b) => b.addEventListener("click", () => connSheet(b.dataset.conn)));
 }
 
+function fmtWhen(iso) {
+  return esc((iso || "").slice(0, 16).replace("T", " "));
+}
+
 function renderActivity() {
   const d = state.dash;
-  const items = d.activity.map((a) => a.type === "task"
-    ? `<div class="feed-item"><span class="feed-dot"></span><div class="feed-body">
+  const nudges = d.nudges || [];
+  const items = d.activity.map((a) => {
+    if (a.type === "task") {
+      return `<div class="feed-item"><span class="feed-dot"></span><div class="feed-body">
          <b>${esc(a.role)}</b> completed “${esc(a.title)}”
-         <div class="feed-when">Week ${a.week} · ${esc((a.at || "").slice(0, 16).replace("T", " "))}</div></div></div>`
-    : `<div class="feed-item"><span class="feed-dot metric"></span><div class="feed-body">
+         <div class="feed-when">Week ${a.week} · ${fmtWhen(a.at)}</div></div></div>`;
+    }
+    if (a.type === "event") {
+      // Mundane activity — taps through to the task's feed when it has one.
+      return `<div class="feed-item${a.task_id ? " tappable" : ""}"${a.task_id ? ` data-ev="${esc(a.task_id)}"` : ""}>` +
+        `<span class="feed-dot mundane"></span><div class="feed-body">${esc(a.label)}` +
+        `<div class="feed-when">${fmtWhen(a.at)}</div></div></div>`;
+    }
+    return `<div class="feed-item"><span class="feed-dot metric"></span><div class="feed-body">
          ${srcBadge(a.source)} <b>${esc(a.kpi)}</b>: ${a.value} ${esc(a.unit)}${a.note ? ` — ${esc(a.note)}` : ""}
-         <div class="feed-when">${esc(a.date || a.at)}</div></div></div>`).join("");
-  $("#view-activity").innerHTML = `<h2>Activity</h2><p class="sub">Completions and metric entries across all tasks</p>
+         <div class="feed-when">${esc(a.date || a.at)}</div></div></div>`;
+  }).join("");
+  $("#view-activity").innerHTML = `<h2>Activity</h2>
+    <p class="sub">Everything happening across the run — completions, metrics, and the small stuff</p>
+    ${nudges.length ? `<div class="card nudge-card">
+      <div class="nudge-head"><span class="brand-mark">✦</span> Nudges from Illiad</div>
+      ${nudges.map((n) => `<div class="nudge-row${n.task_id ? " tappable" : ""}"` +
+        `${n.task_id ? ` data-ev="${esc(n.task_id)}" role="button" tabindex="0"` : ""}>${esc(n.text)}</div>`).join("")}
+    </div>` : ""}
     <div class="card" style="padding:8px 16px">${items || `<div class="empty" style="padding:24px">Nothing yet.</div>`}</div>`;
 }
 

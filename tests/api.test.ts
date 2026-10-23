@@ -124,7 +124,11 @@ describe("runs + dashboard", () => {
     expect(sqls.actuals[0]).toBe(7);
     expect(sqls.total_actual).toBe(7);
     expect(sqls.recent[0].source).toBe("manual");
-    expect(dash.data.activity[0].type).toBe("metric");
+    // The log action itself is mundane activity and sorts first (full ISO
+    // timestamp beats the date-only metric entry); the metric follows.
+    expect(dash.data.activity[0].type).toBe("event");
+    expect(dash.data.activity[0].label).toMatch(/^logged 7/);
+    expect(dash.data.activity.find((a: any) => a.type === "metric")?.value).toBe(7);
   });
 
   test("entry validation", async () => {
@@ -144,6 +148,68 @@ describe("runs + dashboard", () => {
     runId = r.data.id;
     const dash = await call("GET", `/api/runs/${runId}`);
     kpiId = dash.data.kpis[0].id;
+  });
+});
+
+describe("mundane activity log", () => {
+  // Isolated on a fresh run: link counts and the contacts table are shared
+  // state that later suites assert on exactly.
+  let mRun = "", tid = "", title = "", mkpi = "";
+  test("setup: fresh run", async () => {
+    const r = await call("POST", "/api/runs", { playbook_id: seedPbId, start_date: today() });
+    expect(r.status).toBe(201);
+    mRun = r.data.id;
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    const t = dash.data.weeks[0].roles.CEO[0];
+    tid = t.id; title = t.title;
+    mkpi = dash.data.kpis[0].id;
+  });
+
+  test("manual note link logs a mundane event", async () => {
+    const r = await call("POST", `/api/runs/${mRun}/tasks/${tid}/links`, {
+      source: "manual", kind: "note", label: "Signed SOW received",
+    });
+    expect(r.status).toBe(201);
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    const ev = dash.data.activity.find((a: any) => a.type === "event" && a.kind === "feed");
+    expect(ev).toBeDefined();
+    expect(ev.label).toBe(`added manual note to “${title}”`);
+    expect(ev.task_id).toBe(tid);
+  });
+
+  test("email thread link logs a mundane event", async () => {
+    const r = await call("POST", `/api/runs/${mRun}/tasks/${tid}/links`, {
+      source: "email-imap", kind: "thread", ref: "kickoff",
+      label: "Re: Kickoff", meta: { from: "Sam <sam@acme.com>", to: [] },
+    });
+    expect(r.status).toBe(201);
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    const ev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.label === `linked email thread “Re: Kickoff” to “${title}”`);
+    expect(ev).toBeDefined();
+    expect(ev.task_id).toBe(tid);
+  });
+
+  test("task toggle logs done / reopen events", async () => {
+    expect((await call("POST", `/api/runs/${mRun}/tasks/${tid}/toggle`)).data.done).toBe(true);
+    let dash = await call("GET", `/api/runs/${mRun}`);
+    expect(dash.data.activity.some((a: any) => a.label === `marked “${title}” done`)).toBe(true);
+    expect((await call("POST", `/api/runs/${mRun}/tasks/${tid}/toggle`)).data.done).toBe(false);
+    dash = await call("GET", `/api/runs/${mRun}`);
+    expect(dash.data.activity.some((a: any) => a.label === `reopened “${title}”`)).toBe(true);
+  });
+
+  test("kpi entry logs a mundane event", async () => {
+    expect((await call("POST", `/api/kpis/${mkpi}/entries`, { date: today(), value: 3 })).status).toBe(201);
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    const ev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.kind === "kpi" && a.label.startsWith("logged 3"));
+    expect(ev).toBeDefined();
+  });
+
+  test("dashboard carries illiad nudges", async () => {
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    expect(Array.isArray(dash.data.nudges)).toBe(true);
   });
 });
 
@@ -209,6 +275,24 @@ describe("webhook", () => {
       kpi_id: kpiId, date: today(), value: 1,
     })).status).toBe(401);
     expect((await call("POST", `/api/hooks/${KEY}`, { kpi_id: kpiId, date: "bad", value: 1 })).status).toBe(400);
+  });
+
+  test("hook task link + metric log mundane events", async () => {
+    const dash0 = await call("GET", `/api/runs/${runId}`);
+    // CEO[0] is asserted exactly by the "task links" suite; CEO[1] by "stall math".
+    const t = dash0.data.weeks[0].roles.CEO[2];
+    const r = await call("POST", `/api/hooks/${KEY}`, {
+      task_id: t.id, kind: "record", label: "CRM opportunity closed",
+    });
+    expect(r.status).toBe(201);
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const ev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.label === `webhook pushed “CRM opportunity closed” to “${t.title}”`);
+    expect(ev).toBeDefined();
+    expect(ev.task_id).toBe(t.id);
+    const kev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.kind === "kpi" && /via webhook$/.test(a.label));
+    expect(kev).toBeDefined();
   });
 });
 
@@ -1168,6 +1252,15 @@ describe("feed sync endpoints", () => {
     dash = await call3("GET", `/api/runs/${run3}`);
     expect(dash.data.weeks[0].roles.CEO[0].unread).toBe(false);
     expect(dash.data.weeks[0].roles.CEO[0].links[0].meta.unseen).toBe(0);
+  });
+
+  test("sync-feed with new replies logs a mundane event", async () => {
+    const dash = await call3("GET", `/api/runs/${run3}`);
+    const ev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.kind === "feed" && a.label.startsWith("synced “"));
+    expect(ev).toBeDefined();
+    expect(ev.label).toContain("1 new reply");
+    expect(ev.task_id).toBe(task3);
   });
 
   test("sync-feeds caps at 20 most-recently-active threads", async () => {

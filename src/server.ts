@@ -13,6 +13,7 @@ import { sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
+import { nudgeList } from "./illiad/nudges.ts";
 import { getContactPhoto, syncPhotosFromEDS, saveManualPhoto, deleteContactPhoto } from "./contacts.ts";
 import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig, ownEmails } from "./mail-accounts.ts";
 
@@ -136,6 +137,16 @@ export function harvestContacts(db: Database, addrs: any[], exclude?: Set<string
     const clean = db.transaction((emails: string[]) => { for (const e of emails) del.run(e); });
     clean([...exclude]);
   }
+}
+
+/** Mundane activity log — one row per small user-initiated action, surfaced
+ *  in the Activity pane ("added manual note to …"). Exported so Illiad's
+ *  write intents log the same way the routes do. */
+export function logEvent(db: Database, runId: string, kind: string, label: string, detail: any = {}) {
+  db.run(
+    "INSERT INTO events (id, run_id, kind, label, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [uuid(), runId || "", kind, String(label).slice(0, 500),
+     JSON.stringify(detail || {}), new Date().toISOString()]);
 }
 
 // ---------- stakeholders ----------
@@ -312,7 +323,11 @@ export function getDashboard(db: Database, runId: string): any | null {
   });
 
   const tasksDone = tasks.filter((t) => t.done).length;
-  return {
+  // Mundane activity log — small user-initiated actions, newest first.
+  const events: any[] = db.query(
+    "SELECT id, kind, label, detail_json, created_at FROM events WHERE run_id = ? ORDER BY created_at DESC LIMIT 120"
+  ).all(runId);
+  const dash: any = {
     run: {
       id: run.id, name: run.name, playbook_id: run.playbook_id,
       playbook_name: pb.name, start_date: run.start_date, status: run.status,
@@ -331,6 +346,10 @@ export function getDashboard(db: Database, runId: string): any | null {
           unit: k?.unit || "", source: e.source, note: e.note,
         };
       }),
+      ...events.map((e) => ({
+        type: "event", at: e.created_at, kind: e.kind, label: e.label,
+        task_id: (() => { try { return JSON.parse(e.detail_json || "{}").task_id || null; } catch { return null; } })(),
+      })),
     ].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 60),
     overall: {
       tasks_done: tasksDone,
@@ -338,6 +357,9 @@ export function getDashboard(db: Database, runId: string): any | null {
       pct: tasks.length ? Math.round((100 * tasksDone) / tasks.length) : 0,
     },
   };
+  // Illiad behavior nudges — derived from the same payload, never stored.
+  dash.nudges = nudgeList(dash);
+  return dash;
 }
 
 // ---------- app ----------
@@ -463,6 +485,8 @@ export function createApp(opts: {
         db.run("UPDATE tasks SET done = ?, done_at = ? WHERE id = ?", [
           done, done ? new Date().toISOString() : null, taskId,
         ]);
+        logEvent(db, runId, "task", done ? `marked “${t.title}” done` : `reopened “${t.title}”`,
+          { task_id: taskId });
         return json({ id: taskId, done: !!done });
       }
 
@@ -470,7 +494,7 @@ export function createApp(opts: {
       pm = path.match(/^\/api\/kpis\/([^/]+)\/entries$/);
       if (pm && m === "POST") {
         const kpiId = decodeURIComponent(pm[1]);
-        const k: any = db.query("SELECT id FROM kpis WHERE id = ?").get(kpiId);
+        const k: any = db.query("SELECT id, run_id, name, unit FROM kpis WHERE id = ?").get(kpiId);
         if (!k) return err(404, "kpi not found");
         const b = await body(req);
         if (!/^\d{4}-\d{2}-\d{2}$/.test(b?.date || "")) return err(400, "date (YYYY-MM-DD) is required");
@@ -479,6 +503,9 @@ export function createApp(opts: {
         db.run("INSERT INTO metric_entries (id, kpi_id, date, value, source, note) VALUES (?, ?, ?, ?, ?, ?)", [
           id, kpiId, b.date, Number(b.value), b.source || "manual", b.note || "",
         ]);
+        logEvent(db, k.run_id, "kpi",
+          `logged ${Number(b.value)}${k.unit ? ` ${k.unit}` : ""} for ${k.name}`,
+          { kpi_id: kpiId });
         return json({ id }, 201);
       }
       pm = path.match(/^\/api\/entries\/([^/]+)$/);
@@ -491,7 +518,7 @@ export function createApp(opts: {
       pm = path.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/links$/);
       if (pm && m === "POST") {
         const [runId, taskId] = [decodeURIComponent(pm[1]), decodeURIComponent(pm[2])];
-        const t: any = db.query("SELECT id FROM tasks WHERE id = ? AND run_id = ?").get(taskId, runId);
+        const t: any = db.query("SELECT id, title FROM tasks WHERE id = ? AND run_id = ?").get(taskId, runId);
         if (!t) return err(404, "task not found");
         const b = await body(req);
         const label = String(b?.label || "").trim();
@@ -504,6 +531,14 @@ export function createApp(opts: {
           "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 500),
            JSON.stringify(meta), new Date().toISOString()]);
+        // Mundane activity: what was added, and to which task.
+        const feedLabel =
+          source === "manual" && kind === "note" ? `added manual note to “${t.title}”`
+          : source === "email-imap" ? `linked email thread “${label}” to “${t.title}”`
+          : source === "calendar-ical" ? `linked calendar event “${label}” to “${t.title}”`
+          : source === "webhook" ? `webhook pushed “${label}” to “${t.title}”`
+          : `added ${kind} to “${t.title}”`;
+        logEvent(db, runId, "feed", feedLabel, { task_id: taskId, link_id: id });
         // Harvest contacts from linked email threads (from + recipients),
         // never the user's own addresses.
         if (source === "email-imap") {
@@ -539,7 +574,7 @@ export function createApp(opts: {
       pm = path.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/sync-feed$/);
       if (pm && m === "POST") {
         const [runId, taskId] = [decodeURIComponent(pm[1]), decodeURIComponent(pm[2])];
-        const t: any = db.query("SELECT id FROM tasks WHERE id = ? AND run_id = ?").get(taskId, runId);
+        const t: any = db.query("SELECT id, title FROM tasks WHERE id = ? AND run_id = ?").get(taskId, runId);
         if (!t) return err(404, "task not found");
         const links: any[] = threadLinksForTask(taskId);
         const config = imapCfgRow();
@@ -550,6 +585,11 @@ export function createApp(opts: {
         }
         if (links.length && !synced) {
           return err(/missing IMAP credentials/.test(firstErr) ? 400 : 502, firstErr);
+        }
+        if (newReplies > 0) {
+          logEvent(db, runId, "feed",
+            `synced “${t.title}” — ${newReplies} new ${newReplies === 1 ? "reply" : "replies"}`,
+            { task_id: taskId });
         }
         return json({ threads: links.length, synced, new_replies: newReplies });
       }
@@ -663,7 +703,7 @@ export function createApp(opts: {
         if (!subject) return err(400, "subject is required");
         const msgBody = String(b?.body || "").trim();
         if (!msgBody) return err(400, "body is required");
-        const t: any = db.query("SELECT id FROM tasks WHERE id = ? AND run_id = ?")
+        const t: any = db.query("SELECT id, title FROM tasks WHERE id = ? AND run_id = ?")
           .get(b?.task_id, b?.run_id);
         if (!t) return err(404, "task not found");
         const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
@@ -702,6 +742,9 @@ export function createApp(opts: {
           [linkId, b.task_id, normalizeSubject(subject), subject.slice(0, 500),
            JSON.stringify({ from: sent.from, to, date: now.slice(0, 10), count: 1,
                             message_id: sent.messageId }), now]);
+        const toShort = to.length > 1 ? `${to[0]} +${to.length - 1} more` : to[0];
+        logEvent(db, String(b.run_id), "feed", `sent email to ${toShort} from “${t.title}”`,
+          { task_id: b.task_id, link_id: linkId });
         return json({ link_id: linkId, message_id: sent.messageId, from: sent.from }, 201);
       }
       // Recent email contacts for the Assign-from-feed datalist.
@@ -905,7 +948,7 @@ export function createApp(opts: {
         // Link-evidence shape: { task_id, kind?, ref?, label, meta? }.
         // Metric shape (existing): { kpi_id, date, value, note? }.
         if (b?.task_id) {
-          const t: any = db.query("SELECT id FROM tasks WHERE id = ?").get(b.task_id);
+          const t: any = db.query("SELECT id, run_id, title FROM tasks WHERE id = ?").get(b.task_id);
           if (!t) return err(404, "task not found");
           const label = String(b.label || b.ref || "").trim();
           if (!label) return err(400, "label is required");
@@ -915,10 +958,12 @@ export function createApp(opts: {
             "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, 'webhook', ?, ?, ?, ?, ?)",
             [id, b.task_id, String(b.kind || "record").slice(0, 40), String(b.ref || "").slice(0, 200),
              label.slice(0, 500), JSON.stringify(meta), new Date().toISOString()]);
+          logEvent(db, t.run_id, "feed", `webhook pushed “${label}” to “${t.title}”`,
+            { task_id: b.task_id, link_id: id });
           return json({ id }, 201);
         }
         if (!b?.kpi_id) return err(400, "kpi_id is required");
-        const k: any = db.query("SELECT id FROM kpis WHERE id = ?").get(b.kpi_id);
+        const k: any = db.query("SELECT id, run_id, name, unit FROM kpis WHERE id = ?").get(b.kpi_id);
         if (!k) return err(404, "kpi not found");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(b.date || "")) return err(400, "date (YYYY-MM-DD) is required");
         if (!Number.isFinite(Number(b?.value))) return err(400, "numeric value is required");
@@ -926,6 +971,9 @@ export function createApp(opts: {
         db.run("INSERT INTO metric_entries (id, kpi_id, date, value, source, note) VALUES (?, ?, ?, ?, 'webhook', ?)", [
           id, b.kpi_id, b.date, Number(b.value), b.note || "",
         ]);
+        logEvent(db, k.run_id, "kpi",
+          `logged ${Number(b.value)}${k.unit ? ` ${k.unit}` : ""} for ${k.name} via webhook`,
+          { kpi_id: b.kpi_id });
         return json({ id }, 201);
       }
 
