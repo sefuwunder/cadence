@@ -54,12 +54,18 @@ webhook records) with source badges, plus unlink buttons.
   `POST /api/runs/:runId/sync-feeds` (all threads, 20 most-recently-active),
   `POST /api/runs/:runId/tasks/:taskId/feed/read`.
 - **Assign from feed** — start an email thread with contact(s) right from the
-  task: To (comma-separated, with a datalist of recent contacts), Subject
-  (prefilled with the task title), Message, Send. The message goes out through
-  the configured SMTP backend (explicit `smtp_*` config, `CADENCE_SMTP_*` env,
-  `data/imap.json`, or the same GNOME Online Account as IMAP — OAuth2 via
-  XOAUTH2), is then APPENDed into the Sent folder so it shows in sent-mail and
-  later thread searches, and is auto-linked into the feed as
+  task: From (every sending account — see below), To (comma-separated, with a
+  datalist of recent contacts), Subject (prefilled with the task title),
+  Message, Send. The message goes out through the chosen account's SMTP
+  backend, is then APPENDed into that account's Sent folder so it shows in
+  sent-mail and later thread searches, and is auto-linked into the feed as
+  a new thread. **Sending is always user-initiated, never automatic.**
+- **Multiple sending accounts** (`src/mail-accounts.ts`): the From picker
+  lists, in order, accounts added in the connector setup UI (GOA-backed or
+  manual SMTP), every GNOME Online Accounts mail account (zero-config —
+  credentials come from the keyring per send, never stored), and the legacy
+  flat config as a last resort. Manage them in the connector sheet
+  (add / remove / set default) or via `GET|POST /api/email-accounts`.
   `kind: thread` (meta: from/to/date/count/message_id). Contacts are remembered
   (`email_contacts`, most-recently-used first). Sending is always user-initiated
   — the Send button is the confirmation; nothing auto-sends.
@@ -215,11 +221,18 @@ GET                 /api/connectors/email-imap/threads?q=…[&folder=…]
 GET                 /api/connectors/email-imap/goa-accounts
                       → { available, accounts: [{ id, email, provider }] }
                       (never 500s; GOA absent → { available: false, accounts: [] })
-POST                /api/connectors/email-imap/send   {to: string[], subject, body, task_id, run_id}
-                                                  → 201 { link_id, message_id } (sends via SMTP, files in
-                                                  Sent, upserts contacts, links thread into task feed;
-                                                  400 validation / SMTP unconfigured, 404 task not in run)
+POST                /api/connectors/email-imap/send   {to: string[], subject, body, task_id, run_id, from_account?}
+                                                  → 201 { link_id, message_id, from } (sends via the chosen
+                                                  account's SMTP, files in that account's Sent, upserts contacts,
+                                                  links thread into task feed; from_account is an account id or
+                                                  email, default = default account; 400 validation / SMTP
+                                                  unconfigured / unknown account, 404 task not in run)
 GET                 /api/email-contacts           → { contacts: [{ email, name, last_used }] } (MRU, ≤20)
+GET                 /api/email-accounts           → { accounts: [{ id, email, label, kind }], default_account }
+                                                  (no secrets; GOA accounts appear automatically)
+POST                /api/email-accounts           { action: "add", account: { email, label?, goa_account? |
+                                                  smtp_host, smtp_user, smtp_pass?, smtp_port? } } → 201 { id };
+                                                  { action: "remove", id } / { action: "set-default", id } → 200
 GET                 /api/contacts/photo?email=    → image/* bytes from the system address book
                                                   (GOA-synced GNOME contacts, cached 30d server-side;
                                                   404 → UI falls back to initial-based avatar)

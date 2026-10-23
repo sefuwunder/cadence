@@ -464,6 +464,21 @@ async function connSheet(id) {
       <div class="field"><label>Password / app password</label><input id="f-pass" type="password" value="${esc(cfg.pass || "")}" autocomplete="off"></div>
       <div class="field"><label>Sent folder (blank = auto-detect)</label><input id="f-folder" value="${esc(cfg.folder || "")}" autocomplete="off"></div>
       <div class="field"><label>GNOME Online Accounts</label><div id="f-goa" class="meta" style="color:var(--muted);font-size:13px">Checking…</div></div>
+      <div class="field"><label>Sending accounts</label>
+        <div id="f-accounts" class="meta" style="color:var(--muted);font-size:13px">Loading…</div>
+        <div id="f-acct-add" style="margin-top:8px" hidden>
+          <input id="f-acct-email" placeholder="email@company.com" autocomplete="off" style="margin-bottom:8px">
+          <input id="f-acct-label" placeholder="Label (optional)" autocomplete="off" style="margin-bottom:8px">
+          <select id="f-acct-goa" style="margin-bottom:8px"></select>
+          <div class="meta" style="color:var(--muted);font-size:12px;margin:6px 0">— or manual SMTP —</div>
+          <input id="f-acct-host" placeholder="SMTP host" autocomplete="off" style="margin-bottom:8px">
+          <input id="f-acct-user" placeholder="SMTP username" autocomplete="off" style="margin-bottom:8px">
+          <input id="f-acct-pass" type="password" placeholder="SMTP password" autocomplete="off" style="margin-bottom:8px">
+          <button class="btn ghost small" id="f-acct-save" type="button">Add account</button>
+        </div>
+        <button class="btn ghost small" id="f-acct-toggle" type="button" style="margin-top:8px">Add account</button>
+        <p class="meta" style="color:var(--muted);font-size:12px;margin-top:6px">Online Accounts identities work with no setup — credentials come from the keyring per send. The default account is used when the composer doesn't pick one.</p>
+      </div>
       <p class="meta" style="color:var(--muted);font-size:13px">Resolution order: connector config → <span class="mono">CADENCE_IMAP_HOST/PORT/USER/PASS</span> env → gitignored <span class="mono">data/imap.json</span> → GNOME Online Accounts. GOA credentials come from the keyring via goa-daemon and are never stored by Cadence; explicit host/user/pass above take precedence when set.</p>`;
   } else if (id === "webhook") {
     const keys = cfg.keys || {};
@@ -487,7 +502,34 @@ async function connSheet(id) {
     <div class="sheet-actions"><button class="btn ghost" id="f-cancel">Cancel</button>
     <button class="btn" id="f-go">Save</button></div>`);
   $("#f-cancel").onclick = closeSheet;
-  if (id === "email-imap") fillGoaBlock(cfg.goa_account || "");
+  if (id === "email-imap") {
+    fillGoaBlock(cfg.goa_account || "");
+    renderSendAccounts();
+    fillAcctGoa();
+    $("#f-acct-toggle").onclick = () => {
+      const add = $("#f-acct-add");
+      add.hidden = !add.hidden;
+      $("#f-acct-toggle").hidden = !add.hidden;
+    };
+    $("#f-acct-save").onclick = async () => {
+      const goaSel = $("#f-acct-goa");
+      const goaOpt = goaSel && goaSel.value ? goaSel.selectedOptions[0] : null;
+      const payload = goaOpt
+        ? { email: goaOpt.dataset.email, goa_account: goaSel.value,
+            label: $("#f-acct-label").value.trim() }
+        : { email: $("#f-acct-email").value.trim(), label: $("#f-acct-label").value.trim(),
+            smtp_host: $("#f-acct-host").value.trim(), smtp_user: $("#f-acct-user").value.trim(),
+            smtp_pass: $("#f-acct-pass").value };
+      try {
+        await api("/api/email-accounts", "POST", { action: "add", account: payload });
+        $("#f-acct-add").hidden = true;
+        $("#f-acct-toggle").hidden = false;
+        ["f-acct-email", "f-acct-label", "f-acct-host", "f-acct-user", "f-acct-pass"]
+          .forEach((fid) => { $("#" + fid).value = ""; });
+        renderSendAccounts();
+      } catch (e) { alert(e.message); }
+    };
+  }
   const nk = $("#f-newkey");
   if (nk) nk.onclick = () => {
     const key = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) + (crypto.randomUUID ? "" : "-hook");
@@ -530,6 +572,50 @@ async function connSheet(id) {
       .join("");
     el.innerHTML = `<select id="f-goa-account">${opts}</select>
       <p class="meta" style="color:var(--muted);font-size:12px;margin-top:6px">Credentials come from GNOME Settings and are never stored.</p>`;
+  }
+  async function renderSendAccounts() {
+    const box = $("#f-accounts");
+    if (!box) return;
+    let r;
+    try { r = await api("/api/email-accounts"); }
+    catch { box.textContent = "Couldn't load sending accounts."; return; }
+    if (!$("#f-accounts")) return; // sheet closed while loading
+    const acc = r.accounts || [];
+    box.innerHTML = acc.length ? acc.map((a) => `
+      <div class="acct-row">
+        <div style="flex:1;min-width:0"><b>${esc(a.label || a.email)}</b>
+          <div class="meta">${esc(a.email)} · ${a.kind === "goa" ? "Online Accounts" : "manual"}</div></div>
+        ${a.id === r.default_account
+          ? `<span class="state-chip acct-default">Default</span>`
+          : `<button class="btn ghost small" data-acct-default="${esc(a.id)}" type="button">Set default</button>`}
+        ${a.id.startsWith("cfg:") ? `<button class="btn ghost small" data-acct-remove="${esc(a.id)}" type="button">Remove</button>` : ""}
+      </div>`).join("")
+      : `<div class="meta">No sending accounts yet — add one below.</div>`;
+    box.querySelectorAll("[data-acct-default]").forEach((b) => b.onclick = async () => {
+      try {
+        await api("/api/email-accounts", "POST", { action: "set-default", id: b.dataset.acctDefault });
+        renderSendAccounts();
+      } catch (e) { alert(e.message); }
+    });
+    box.querySelectorAll("[data-acct-remove]").forEach((b) => b.onclick = async () => {
+      if (!confirm("Remove this sending account?")) return;
+      try {
+        await api("/api/email-accounts", "POST", { action: "remove", id: b.dataset.acctRemove });
+        renderSendAccounts();
+      } catch (e) { alert(e.message); }
+    });
+  }
+  async function fillAcctGoa() {
+    const sel = $("#f-acct-goa");
+    if (!sel) return;
+    let g;
+    try { g = await api("/api/connectors/email-imap/goa-accounts"); }
+    catch { sel.hidden = true; return; }
+    if (!$("#f-acct-goa")) return;
+    if (!g.available || !g.accounts.length) { sel.hidden = true; return; }
+    sel.innerHTML = `<option value="">— pick an Online Accounts identity —</option>` +
+      g.accounts.map((a) =>
+        `<option value="${esc(a.id)}" data-email="${esc(a.email)}">${esc(a.email)} (${esc(a.provider)})</option>`).join("");
   }
   async function connSheetSave(cid, cfgObj) {
     try {
@@ -738,6 +824,7 @@ function evForm(taskId, src) {
     // button is the confirmation; nothing is sent until it is tapped.
     const task = findTask(taskId);
     f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Assign from feed — start an email thread with contact(s). Sent from your mail account, then linked here.</p>
+      <div class="field"><label>From</label><select id="f-from"></select></div>
       <div class="field"><label>To</label>
         <input id="f-to" list="f-contacts" placeholder="name@company.com, …" autocomplete="off">
         <datalist id="f-contacts"></datalist></div>
@@ -746,6 +833,12 @@ function evForm(taskId, src) {
       <div class="field"><label>Message</label>
         <textarea id="f-body" rows="4" placeholder="Write the first message…"></textarea></div>
       <button class="btn" id="f-send">Send</button>`;
+    api("/api/email-accounts").then((r) => {
+      const sel = $("#f-from");
+      if (!sel || !r.accounts) return;
+      sel.innerHTML = r.accounts.map((a) =>
+        `<option value="${esc(a.id)}"${a.id === r.default_account ? " selected" : ""}>${esc(a.label || a.email)}</option>`).join("");
+    }).catch(() => { /* single-account setups still send via the default */ });
     api("/api/email-contacts").then((r) => {
       const dl = $("#f-contacts");
       if (dl && r.contacts) {
@@ -765,7 +858,8 @@ function evForm(taskId, src) {
       btn.textContent = "Sending…";
       try {
         await api("/api/connectors/email-imap/send", "POST",
-          { to, subject, body, task_id: taskId, run_id: state.runId });
+          { to, subject, body, task_id: taskId, run_id: state.runId,
+            from_account: $("#f-from") ? $("#f-from").value : "" });
         await loadDash();
         feedSheet(taskId); // links are newest-first, so the thread lands on top
       } catch (e) {

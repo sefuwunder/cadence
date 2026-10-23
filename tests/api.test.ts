@@ -770,7 +770,8 @@ describe("assign from feed (send endpoint)", () => {
         }
         if (last === "STARTTLS") return "220 2.0.0 Ready";
         if (last === "AUTH LOGIN") return "334 VXNlcm5hbWU6";
-        if (last === b64("me@example.com")) return "334 UGFzc3dvcmQ6";
+        if (/^[A-Za-z0-9+/=]+$/.test(last) && Buffer.from(last, "base64").toString("utf8").includes("@"))
+          return "334 UGFzc3dvcmQ6"; // any email-like AUTH LOGIN username
         if (last === b64("pw")) return "235 2.7.0 ok";
         if (last.startsWith("MAIL FROM:")) return "250 2.1.0 Ok";
         if (last.startsWith("RCPT TO:")) return "250 2.1.5 Ok";
@@ -872,8 +873,120 @@ describe("assign from feed (send endpoint)", () => {
     expect(emails).toContain("b@x.com");
     expect(new Set(emails).size).toBe(emails.length);
   });
-});
+  describe("sending accounts", () => {
+    const stubGoaFns: any = {
+      listGoaMailAccounts: async () => ([
+        { id: "g1", email: "g@gmail.com", providerName: "Google", providerType: "google",
+          smtpHost: "smtp.gmail.com", smtpUser: "g@gmail.com", smtpTls: true, smtpSsl: false },
+        { id: "o1", email: "o@outlook.com", providerName: "Microsoft", providerType: "windows_live",
+          smtpHost: "smtp-mail.outlook.com", smtpUser: "o@outlook.com", smtpTls: true, smtpSsl: false },
+      ]),
+      getGoaCredentials: async () => ({ oauth2: false, token: "", smtpPassword: "goapw", imapPassword: "" }),
+    };
 
+    test("listSendAccounts merges configured + GOA, dedupes by email", async () => {
+      const m = await import("../src/mail-accounts.ts");
+      const db: any = app2.db;
+      // one manual + one GOA-backed configured entry (g@gmail.com overlaps a GOA account)
+      db.run("INSERT INTO connector_cfg (id, name, config_json) VALUES ('email-imap', 'Email (IMAP)', ?) " +
+        "ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+        [JSON.stringify({ accounts: [
+          { id: "a1", email: "m@corp.com", label: "Corp", smtp_host: "smtp.corp.com", smtp_user: "m@corp.com", smtp_pass: "pw" },
+          { id: "a2", email: "g@gmail.com", label: "Gmail", goa_account: "g1" },
+        ] })]);
+      const { accounts, default_account } = await m.listSendAccounts(db, stubGoaFns);
+      const emails = accounts.map((a: any) => a.email).sort();
+      expect(emails).toEqual(["g@gmail.com", "m@corp.com", "o@outlook.com"]);
+      expect(default_account).toBe(accounts[0].id); // first configured wins
+      const goaAcct = accounts.find((a: any) => a.email === "o@outlook.com");
+      expect(goaAcct.id).toBe("goa:o1");
+      expect(goaAcct.kind).toBe("goa");
+      // restore the flat config the send tests rely on
+      db.run("UPDATE connector_cfg SET config_json = ? WHERE id = 'email-imap'",
+        [JSON.stringify({ smtp_host: "smtp.example.com", smtp_port: 587, smtp_user: "me@example.com", smtp_pass: "pw" })]);
+    });
+
+    test("resolveSmtpForAccount: goa account → GOA creds; manual → entry creds; unknown → throws", async () => {
+      const m = await import("../src/mail-accounts.ts");
+      const db: any = app2.db;
+      db.run("UPDATE connector_cfg SET config_json = ? WHERE id = 'email-imap'",
+        [JSON.stringify({ accounts: [
+          { id: "a1", email: "m@corp.com", smtp_host: "smtp.corp.com", smtp_user: "m@corp.com", smtp_pass: "pw" },
+        ] })]);
+      const g = await m.resolveSmtpForAccount(db, "goa:g1", stubGoaFns);
+      expect(g.cfg.host).toBe("smtp.gmail.com");
+      expect(g.cfg.pass).toBe("goapw");
+      expect(g.account.email).toBe("g@gmail.com");
+      const man = await m.resolveSmtpForAccount(db, "m@corp.com", stubGoaFns); // bare email works too
+      expect(man.cfg.host).toBe("smtp.corp.com");
+      expect(man.cfg.user).toBe("m@corp.com");
+      await expect(m.resolveSmtpForAccount(db, "nope@x.com", stubGoaFns)).rejects.toThrow(/unknown sending account/);
+      db.run("UPDATE connector_cfg SET config_json = ? WHERE id = 'email-imap'",
+        [JSON.stringify({ smtp_host: "smtp.example.com", smtp_port: 587, smtp_user: "me@example.com", smtp_pass: "pw" })]);
+    });
+
+    test("imapConfigForAccount prefers the sending account's IMAP", async () => {
+      const m = await import("../src/mail-accounts.ts");
+      const db: any = app2.db;
+      const imap = m.imapConfigForAccount(db, { id: "goa:g1", email: "g@gmail.com", label: "", kind: "goa" });
+      expect(imap.goa_account).toBe("g1");
+    });
+
+    test("HTTP: add / list / set-default / remove accounts", async () => {
+      // add manual
+      let r = await call2("POST", "/api/email-accounts", { action: "add",
+        account: { email: "second@example.com", label: "Second", smtp_host: "smtp.example.com", smtp_user: "second@example.com", smtp_pass: "pw" } });
+      expect(r.status).toBe(201);
+      const id = r.data.id;
+      expect(id.startsWith("cfg:")).toBe(true);
+      // duplicate rejected
+      r = await call2("POST", "/api/email-accounts", { action: "add",
+        account: { email: "second@example.com", smtp_host: "x", smtp_user: "x" } });
+      expect(r.status).toBe(400);
+      // bad email rejected
+      r = await call2("POST", "/api/email-accounts", { action: "add", account: { email: "nope" } });
+      expect(r.status).toBe(400);
+      // listed (this machine has no GOA, so only the manual one)
+      r = await call2("GET", "/api/email-accounts");
+      expect(r.data.accounts.some((a: any) => a.id === id)).toBe(true);
+      // set default
+      r = await call2("POST", "/api/email-accounts", { action: "set-default", id });
+      expect(r.status).toBe(200);
+      r = await call2("GET", "/api/email-accounts");
+      expect(r.data.default_account).toBe(id);
+      // remove
+      r = await call2("POST", "/api/email-accounts", { action: "remove", id });
+      expect(r.status).toBe(200);
+      r = await call2("GET", "/api/email-accounts");
+      expect(r.data.accounts.some((a: any) => a.id === id)).toBe(false);
+      expect(r.data.default_account).not.toBe(id);
+    });
+
+    test("send from a chosen account uses its identity", async () => {
+      let r = await call2("POST", "/api/email-accounts", { action: "add",
+        account: { email: "second@example.com", smtp_host: "smtp.example.com", smtp_user: "second@example.com", smtp_pass: "pw" } });
+      const id = r.data.id;
+      const pb = await call2("GET", "/api/playbooks");
+      const rr = await call2("POST", "/api/runs", { playbook_id: pb.data[0].id, start_date: today() });
+      const dash = await call2("GET", `/api/runs/${rr.data.id}`);
+      const task = dash.data.weeks[0].roles.CEO[0].id;
+      r = await call2("POST", "/api/connectors/email-imap/send",
+        { to: ["c@x.com"], subject: "From acct", body: "Hi", task_id: task, run_id: rr.data.id, from_account: id });
+      expect(r.status).toBe(201);
+      expect(r.data.from).toBe("second@example.com");
+      expect(smtpSent.some((s: string) => s.startsWith("MAIL FROM:<second@example.com>"))).toBe(true);
+      // the thread link records the actual sender
+      const dash2 = await call2("GET", `/api/runs/${rr.data.id}`);
+      const t2 = dash2.data.weeks[0].roles.CEO.find((x: any) => x.id === task);
+      const thread = t2.links.find((l: any) => l.kind === "thread");
+      expect(thread.meta.from).toBe("second@example.com");
+      // unknown account → 400
+      r = await call2("POST", "/api/connectors/email-imap/send",
+        { to: ["c@x.com"], subject: "X", body: "Hi", task_id: task, run_id: rr.data.id, from_account: "goa:missing" });
+      expect(r.status).toBe(400);
+      await call2("POST", "/api/email-accounts", { action: "remove", id });
+    });
+  });
 describe("thread sync (syncThread)", () => {
   const M = (over: any = {}) => ({
     messageId: "m1", from: "jane@acme.com", date: "2026-10-20",
@@ -1416,4 +1529,6 @@ describe("contact photo bulk sync", () => {
       else process.env.CADENCE_ADDRESSBOOK_EXPORT = origBin;
     }
   });
+});
+
 });

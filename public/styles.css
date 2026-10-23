@@ -127,6 +127,16 @@ select { max-width: 46vw; }
 .avatar-stack .avatar { margin-left: -9px; border: 2px solid var(--ink-2); }
 .avatar-stack .avatar:first-child { margin-left: 0; }
 .avatar-more { background: var(--ink-3) !important; color: var(--muted) !important; }
+
+/* sending accounts (connector setup) */
+.acct-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+.acct-row:last-child { border-bottom: 0; }
+.acct-row .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.acct-row .btn { flex: 0 0 auto; }
+.state-chip.acct-default { background: var(--gold-dim); color: var(--gold); }
 .link-row, .thread-row {
   display: flex; gap: 10px; align-items: center;
   padding: 10px 0; border-bottom: 1px solid var(--line);

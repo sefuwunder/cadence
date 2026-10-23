@@ -9,11 +9,12 @@ import { initDb, seedIfEmpty } from "./db.ts";
 import { getConnector, connectors } from "./connectors/index.ts";
 import { keyIsValid } from "./connectors/webhook.ts";
 import { searchThreads, appendToSent, normalizeSubject, syncThread, type ThreadMessage } from "./connectors/email-imap.ts";
-import { resolveSmtpConfig, sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
+import { sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
 import { getContactPhoto, syncPhotosFromEDS } from "./contacts.ts";
+import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig } from "./mail-accounts.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -650,21 +651,23 @@ export function createApp(opts: {
         if (!t) return err(404, "task not found");
         const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
         const config = row ? JSON.parse(row.config_json) : {};
-        let cfg;
+        let resolved;
         try {
-          cfg = await resolveSmtpConfig(config);
+          resolved = await resolveSmtpForAccount(db, String(b?.from_account || b?.from || ""));
         } catch (e: any) {
           return err(400, e?.message || "SMTP is not configured");
         }
+        const cfg = resolved.cfg;
         let sent;
         try {
           sent = await sendWithConfig(cfg, { to, subject, body: msgBody }, opts.smtpIoFactory);
         } catch (e: any) {
           return err(502, e?.message || "send failed");
         }
-        // File the sent message in Sent (best effort — the mail is already out).
+        // File the sent message in the SENDING account's Sent folder
+        // (best effort — the mail is already out).
         try {
-          await appendToSent({ config, raw: sent.raw });
+          await appendToSent({ config: imapConfigForAccount(db, resolved.account), raw: sent.raw });
         } catch (e: any) {
           console.error("[cadence] sent-mail APPEND failed:", e?.message || e);
         }
@@ -682,13 +685,71 @@ export function createApp(opts: {
           [linkId, b.task_id, normalizeSubject(subject), subject.slice(0, 500),
            JSON.stringify({ from: sent.from, to, date: now.slice(0, 10), count: 1,
                             message_id: sent.messageId }), now]);
-        return json({ link_id: linkId, message_id: sent.messageId }, 201);
+        return json({ link_id: linkId, message_id: sent.messageId, from: sent.from }, 201);
       }
       // Recent email contacts for the Assign-from-feed datalist.
       if (path === "/api/email-contacts" && m === "GET") {
         const contacts = db.query(
           "SELECT email, name, last_used FROM email_contacts ORDER BY last_used DESC LIMIT 20").all();
         return json({ contacts });
+      }
+      // Sending accounts for the Assign-from-feed From picker.
+      // No secrets: only ids, emails, labels, kinds.
+      if (path === "/api/email-accounts" && m === "GET") {
+        return json(await listSendAccounts(db).catch(() => ({ accounts: [], default_account: null })));
+      }
+      // Manage the configured sending accounts (GOA accounts need no config
+      // and can't be added/removed here — they appear automatically).
+      if (path === "/api/email-accounts" && m === "POST") {
+        const b = await body(req);
+        const action = String(b?.action || "");
+        const config = readImapConfig(db);
+        config.accounts = Array.isArray(config.accounts) ? config.accounts : [];
+        if (action === "add") {
+          const a = b?.account || {};
+          const email = String(a.email || "").trim().toLowerCase();
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err(400, "a valid email is required");
+          if (config.accounts.some((x: any) => String(x.email || "").toLowerCase() === email)) {
+            return err(400, "that email is already a sending account");
+          }
+          const entry: any = {
+            id: "a" + uuid().slice(0, 8),
+            email,
+            label: String(a.label || email).slice(0, 120),
+          };
+          if (a.goa_account) {
+            entry.goa_account = String(a.goa_account);
+          } else {
+            entry.smtp_host = String(a.smtp_host || "").trim();
+            entry.smtp_port = a.smtp_port ? Number(a.smtp_port) : undefined;
+            entry.smtp_user = String(a.smtp_user || email).trim();
+            if (a.smtp_pass) entry.smtp_pass = String(a.smtp_pass);
+            if (!entry.smtp_host || !entry.smtp_user) {
+              return err(400, "smtp_host and smtp_user are required (or pick a GOA account)");
+            }
+          }
+          config.accounts.push(entry);
+          writeImapConfig(db, config);
+          return json({ id: `cfg:${entry.id}` }, 201);
+        }
+        if (action === "remove") {
+          const id = String(b?.id || "");
+          const ix = config.accounts.findIndex((x: any) => `cfg:${x.id || x.email}` === id);
+          if (ix < 0) return err(404, "account not found");
+          config.accounts.splice(ix, 1);
+          if (config.default_account === id) delete config.default_account;
+          writeImapConfig(db, config);
+          return json({ ok: true });
+        }
+        if (action === "set-default") {
+          const id = String(b?.id || "");
+          const { accounts } = await listSendAccounts(db).catch(() => ({ accounts: [] as any[] }));
+          if (!accounts.some((a: any) => a.id === id)) return err(404, "account not found");
+          config.default_account = id;
+          writeImapConfig(db, config);
+          return json({ ok: true });
+        }
+        return err(400, "action must be add, remove, or set-default");
       }
       // Bulk-sync contact photos from every enabled EDS address book
       // (GOA-synced GNOME contacts) into the photo cache. Verbose result
