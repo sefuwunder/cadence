@@ -9,6 +9,8 @@
   --gold: #c9a227;
   --gold-dim: rgba(201, 162, 39, 0.16);
   --green: #57b883;
+  --blue: #6aa8ff;
+  --amber: #d9a441;
   --red: #d0665a;
   --line: rgba(236, 233, 226, 0.09);
   --radius: 14px;
@@ -65,7 +67,7 @@ select { max-width: 46vw; }
 .card h3 { margin: 0 0 4px; font-size: 16px; }
 .card .meta { color: var(--muted); font-size: 13px; }
 
-/* ---------- tasks ---------- */
+/* ---------- tasks (cards; state → accent color, never red) ---------- */
 .role-block { margin-bottom: 18px; }
 .role-head {
   display: flex; align-items: center; gap: 10px; margin: 0 0 8px;
@@ -73,42 +75,60 @@ select { max-width: 46vw; }
   color: var(--gold);
 }
 .role-head .count { color: var(--faint); font-weight: 500; letter-spacing: 0; }
-.task {
-  display: flex; align-items: flex-start; gap: 12px;
-  padding: 12px 4px; border-bottom: 1px solid var(--line); min-height: 44px;
+.task-card {
+  background: var(--ink-2); border: 1px solid var(--line);
+  border-left: 3px solid var(--faint);
+  border-radius: var(--radius); padding: 13px 15px; margin-bottom: 10px;
+  cursor: pointer; min-height: 56px;
 }
-.task:last-child { border-bottom: 0; }
-.task.done .task-title { color: var(--faint); text-decoration: line-through; }
-.check {
-  flex: 0 0 auto; width: 28px; height: 28px; margin-top: 1px;
-  border: 2px solid var(--faint); border-radius: 50%;
-  background: transparent; cursor: pointer; padding: 0;
-  display: flex; align-items: center; justify-content: center;
-  color: transparent; font-size: 15px;
+.task-card:active { transform: scale(0.99); }
+.task-card:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.task-card.st-done { border-left-color: var(--green); }
+.task-card.st-unread { border-left-color: var(--blue); }
+.task-card.st-stalled { border-left-color: var(--amber); }
+.task-card.st-done .task-title { color: var(--faint); text-decoration: line-through; }
+.task-card-main { display: flex; align-items: center; gap: 10px; }
+.task-title { flex: 1; font-size: 15.5px; min-width: 0; }
+.state-chip {
+  font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 99px;
+  white-space: nowrap; flex: 0 0 auto;
 }
-.task.done .check { background: var(--gold); border-color: var(--gold); color: #17130a; }
-.task-title { flex: 1; font-size: 15.5px; }
+.st-done .state-chip { background: rgba(87, 184, 131, 0.16); color: var(--green); }
+.st-unread .state-chip { background: rgba(106, 168, 255, 0.16); color: var(--blue); }
+.st-stalled .state-chip { background: rgba(217, 164, 65, 0.18); color: var(--amber); }
+.task-card-sub { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
 
-/* evidence affordance */
-.task .ev {
-  flex: 0 0 auto; background: none; border: 0; color: var(--faint);
-  cursor: pointer; min-width: 44px; min-height: 44px; padding: 0;
-  display: flex; align-items: center; justify-content: center; gap: 3px;
+/* ---------- folds ---------- */
+.fold-more {
+  display: block; width: 100%; background: none; border: 1px dashed var(--line);
+  color: var(--muted); border-radius: 10px; padding: 10px; margin: 2px 0 10px;
+  font: inherit; font-size: 13.5px; cursor: pointer; min-height: 44px;
 }
-.task .ev .ev-ico { font-size: 16px; opacity: 0.75; }
-.task .ev.has { color: var(--gold); }
-.task .ev.has .ev-ico { opacity: 1; }
-.ev-n {
-  font-size: 11px; font-weight: 700; background: var(--gold-dim); color: var(--gold);
-  border-radius: 99px; padding: 1px 7px;
+.fold-more:active { transform: scale(0.99); }
+.fold-toggle {
+  display: flex; align-items: center; justify-content: space-between; width: 100%;
+  background: none; border: 0; color: var(--text); font: inherit; font-size: 16px;
+  font-weight: 700; padding: 12px 0; margin-top: 20px; cursor: pointer; min-height: 44px;
 }
+.fold-toggle .fold-arrow { color: var(--gold); }
+
+/* ---------- avatars ---------- */
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: #14141b; font-weight: 700; flex: 0 0 auto;
+}
+.avatar-stack { display: inline-flex; align-items: center; flex: 0 0 auto; margin-right: 2px; }
+.avatar-stack .avatar { margin-left: -9px; border: 2px solid var(--ink-2); }
+.avatar-stack .avatar:first-child { margin-left: 0; }
+.avatar-more { background: var(--ink-3) !important; color: var(--muted) !important; }
 .link-row, .thread-row {
   display: flex; gap: 10px; align-items: center;
   padding: 10px 0; border-bottom: 1px solid var(--line);
 }
 .link-row:last-child, .thread-row:last-child { border-bottom: 0; }
-.link-row .link-body, .thread-row .thread-body { flex: 1; font-size: 14px; min-width: 0; }
-.link-row .meta, .thread-row .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.link-row .link-body, .thread-row .thread-body { flex: 1 1 auto; font-size: 14px; min-width: 0; }
+.link-row .btn { flex: 0 0 auto; align-self: center; }
+.link-row .meta, .thread-row .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
 .link-row .link-body b, .thread-row .thread-body b {
   display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -131,8 +151,8 @@ select { max-width: 46vw; }
 .week-row .nums b { color: var(--text); }
 .src-badge {
   display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
-  padding: 2px 8px; border-radius: 99px; margin-right: 6px;
-  background: var(--ink-3); color: var(--muted); text-transform: uppercase;
+  padding: 2px 8px; border-radius: 99px; margin-right: 6px; white-space: nowrap;
+  background: var(--ink-3); color: var(--muted); text-transform: uppercase; flex: 0 0 auto;
 }
 .src-badge.manual { color: #9fc3e8; }
 .src-badge.email-imap { color: #d3a6e0; }
@@ -218,24 +238,11 @@ select { max-width: 46vw; }
   #sheet { left: auto; right: 0; top: 0; bottom: 0; width: 420px; border-radius: 0; max-height: none; }
 }
 
-/* unread replies dot (task rows, stakeholder rows) */
+/* unread replies dot (stakeholder rows) */
 .unread-dot {
   display: inline-block; width: 9px; height: 9px; border-radius: 50%;
   background: var(--gold); margin-left: 8px; vertical-align: 1px;
   box-shadow: 0 0 6px var(--gold-dim);
-}
-
-/* stalled-task rows on Today */
-.stall-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 4px; border-bottom: 1px solid var(--line); cursor: pointer;
-}
-.stall-row:last-child { border-bottom: 0; }
-.stall-row .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
-.stall-days {
-  flex: 0 0 auto; font-size: 12.5px; font-weight: 700; color: var(--gold);
-  background: var(--gold-dim); border: 1px solid var(--gold);
-  border-radius: 999px; padding: 4px 10px; white-space: nowrap;
 }
 
 /* people (stakeholder rollup) */

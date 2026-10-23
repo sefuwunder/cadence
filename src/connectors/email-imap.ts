@@ -196,6 +196,8 @@ export interface ThreadSyncResult {
   meta: Record<string, any>;
   newCount: number;
   seeded: boolean;
+  /** From-addresses seen in this sync (for contact harvesting). */
+  harvest: string[];
 }
 
 function msgKey(m: ThreadMessage): string {
@@ -215,6 +217,7 @@ export async function syncThread(opts: {
   const newest = msgs[0];
   const ids = msgs.map(msgKey);
   const prevSeen: string[] = Array.isArray(meta.seen_ids) ? meta.seen_ids : [];
+  const harvest = [...new Set(msgs.map((m) => m.from).filter(Boolean))];
   if (!meta.seen_ids) {
     return {
       meta: {
@@ -223,7 +226,7 @@ export async function syncThread(opts: {
         last_date: newest?.date || meta.date || "",
         last_snippet: newest?.snippet || "",
       },
-      newCount: 0, seeded: true,
+      newCount: 0, seeded: true, harvest,
     };
   }
   const seenSet = new Set(prevSeen);
@@ -238,6 +241,7 @@ export async function syncThread(opts: {
       last_snippet: newest?.snippet || meta.last_snippet || "",
     },
     newCount: fresh.length, seeded: false,
+    harvest: [...new Set(fresh.map((m) => m.from).filter(Boolean))],
   };
 }
 

@@ -3,7 +3,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { createApp, STALL_DAYS, stallStatus, parseAddr } from "../src/server.ts";
+import { createApp, STALL_DAYS, stallStatus, parseAddr, harvestContacts, syncRunFeeds } from "../src/server.ts";
 import { connectors } from "../src/connectors/index.ts";
 import { _test as imapTest, syncThread } from "../src/connectors/email-imap.ts";
 import { _test as calTest } from "../src/connectors/calendar-ical.ts";
@@ -504,6 +504,69 @@ describe("task links", () => {
     const empty = await call("GET", "/api/connectors/email-imap/threads");
     expect(empty.status).toBe(200);
     expect(empty.data.threads).toEqual([]);
+  });
+});
+
+describe("contact harvesting", () => {
+  const contacts = () =>
+    app.db.query("SELECT email, name FROM email_contacts ORDER BY email").all();
+
+  test("linking an email thread harvests from + to addresses", async () => {
+    const t: any = (await call("GET", `/api/runs/${runId}`)).data.weeks[0].roles.CEO[0];
+    const r = await call("POST", `/api/runs/${runId}/tasks/${t.id}/links`, {
+      source: "email-imap", kind: "thread", ref: "harvest one", label: "Harvest One",
+      meta: { from: "Jane Doe <jane@acme.com>", to: ["bob@acme.com"], date: "2026-10-22" },
+    });
+    expect(r.status).toBe(201);
+    const found = new Map(contacts().map((c: any) => [c.email, c.name]));
+    expect(found.get("jane@acme.com")).toBe("Jane Doe");
+    expect(found.has("bob@acme.com")).toBe(true);
+    await call("DELETE", `/api/links/${r.data.id}`);
+  });
+
+  test("first-seen name wins; last_used refreshes", async () => {
+    harvestContacts(app.db, ["Other Name <jane@acme.com>"]);
+    const found = new Map(contacts().map((c: any) => [c.email, c.name]));
+    expect(found.get("jane@acme.com")).toBe("Jane Doe");
+    harvestContacts(app.db, ["not-an-email", "", null, "  "]);
+    expect(contacts().some((c: any) => c.email === "not-an-email")).toBe(false);
+  });
+
+  test("syncThread returns harvest addresses (seed + fresh)", async () => {
+    const msgs = [
+      { messageId: "m1", from: "Alice <alice@acme.com>", date: "2026-10-20", subject: "S", snippet: "hi" },
+      { messageId: "m2", from: "bob@acme.com", date: "2026-10-21", subject: "S", snippet: "yo" },
+    ];
+    const seed = await syncThread({
+      link: { ref: "s", label: "S" }, config: {},
+      fetchMessages: async () => msgs as any,
+    });
+    expect(seed.seeded).toBe(true);
+    expect(new Set(seed.harvest)).toEqual(new Set(["Alice <alice@acme.com>", "bob@acme.com"]));
+    const again = await syncThread({
+      link: { ref: "s", label: "S", meta: seed.meta }, config: {},
+      fetchMessages: async () => [...msgs, { messageId: "m3", from: "Cara <cara@acme.com>", date: "2026-10-22", subject: "S", snippet: "hey" }] as any,
+    });
+    expect(again.newCount).toBe(1);
+    expect(again.harvest).toEqual(["Cara <cara@acme.com>"]);
+  });
+
+  test("syncRunFeeds harvests new-message senders into contacts", async () => {
+    const t: any = (await call("GET", `/api/runs/${runId}`)).data.weeks[0].roles.CEO[0];
+    const r = await call("POST", `/api/runs/${runId}/tasks/${t.id}/links`, {
+      source: "email-imap", kind: "thread", ref: "harvest two", label: "Harvest Two",
+      meta: { from: "dave@acme.com", date: "2026-10-20" },
+    });
+    expect(r.status).toBe(201);
+    const out = await syncRunFeeds(app.db, runId, async () => [
+      { messageId: "h1", from: "Erin <erin@acme.com>", date: "2026-10-23", subject: "Harvest Two", snippet: "new" },
+    ] as any);
+    expect(out.synced).toBe(1);
+    // first sync seeds silently (no "new" replies), but still harvests the sender
+    expect(out.new_replies).toBe(0);
+    const found = new Map(contacts().map((c: any) => [c.email, c.name]));
+    expect(found.get("erin@acme.com")).toBe("Erin");
+    await call("DELETE", `/api/links/${r.data.id}`);
   });
 });
 

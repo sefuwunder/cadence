@@ -94,22 +94,44 @@ function setTab(tab) {
 }
 
 /* ---------- shared render bits ---------- */
-function taskRow(t) {
+function taskState(t) {
+  if (t.done) return "done";
+  if (t.unread) return "unread";
+  if (t.stalled) return "stalled";
+  return "todo";
+}
+function unreadCount(t) {
+  return (t.links || []).reduce((a, l) => a + (Number((l.meta || {}).unseen) || 0), 0);
+}
+/** Task card. Whole card opens the feed sheet (data-ev). State → accent color. */
+function taskCard(t, sub) {
   const n = (t.links || []).length;
-  return `<div class="task${t.done ? " done" : ""}" data-task="${esc(t.id)}">
-    <button class="check" data-toggle="${esc(t.id)}" aria-label="toggle task">${t.done ? "✓" : ""}</button>
-    <span class="task-title">${esc(t.title)}${t.unread ? `<span class="unread-dot" title="Unread replies"></span>` : ""}</span>
-    <button class="ev${n ? " has" : ""}" data-ev="${esc(t.id)}" aria-label="task feed" title="Feed">
-      <span class="ev-ico">🔗</span>${n ? `<span class="ev-n">${n}</span>` : ""}
-    </button>
+  const st = taskState(t);
+  const uc = unreadCount(t);
+  const chip = t.done ? `<span class="state-chip">Done</span>`
+    : uc > 0 ? `<span class="state-chip">${uc} new</span>`
+    : t.stalled ? `<span class="state-chip">${t.days_quiet || 0}d quiet</span>` : "";
+  return `<div class="task-card st-${st}" data-ev="${esc(t.id)}" role="button" tabindex="0" aria-label="${esc(t.title)} — open feed">
+    <div class="task-card-main"><span class="task-title">${esc(t.title)}</span>${chip}</div>
+    ${sub ? `<div class="task-card-sub">${sub}</div>` : ""}
+    ${n ? `<div class="task-card-sub">${n} in feed</div>` : ""}
   </div>`;
 }
-function roleBlocks(roles) {
+/** Folded section: first card visible, rest behind an expander. */
+function foldCards(cards) {
+  if (cards.length <= 1) return cards.join("");
+  const [first, ...rest] = cards;
+  return `${first}
+    <button class="fold-more" data-foldmore>Show all ${cards.length} ▾</button>
+    <div class="fold-rest" hidden>${rest.join("")}</div>`;
+}
+function roleBlocks(roles, folded) {
   return Object.entries(roles).map(([role, tasks]) => {
     const done = tasks.filter((t) => t.done).length;
+    const cards = tasks.map((t) => taskCard(t));
     return `<div class="role-block">
       <div class="role-head">${esc(role)} <span class="count">${done}/${tasks.length}</span></div>
-      ${tasks.map(taskRow).join("")}
+      ${folded ? foldCards(cards) : cards.join("")}
     </div>`;
   }).join("");
 }
@@ -135,13 +157,28 @@ function render() {
 document.addEventListener("click", async (e) => {
   const evb = e.target.closest("[data-ev]");
   if (evb) { feedSheet(evb.dataset.ev); return; }
-  const t = e.target.closest("[data-toggle]");
-  if (t) {
-    t.disabled = true;
-    try {
-      await api(`/api/runs/${state.runId}/tasks/${t.dataset.toggle}/toggle`, "POST");
-      await loadDash();
-    } catch (err) { alert(err.message); t.disabled = false; }
+  const fm = e.target.closest("[data-foldmore]");
+  if (fm) {
+    const rest = fm.nextElementSibling;
+    const open = rest.hidden;
+    rest.hidden = !open;
+    fm.textContent = open ? "Show less ▴" : `Show all ${rest.children.length + 1} ▾`;
+    return;
+  }
+  const ft = e.target.closest("[data-foldtoggle]");
+  if (ft) {
+    const body = document.getElementById(ft.dataset.foldtoggle);
+    const open = body.hidden;
+    body.hidden = !open;
+    ft.setAttribute("aria-expanded", String(open));
+    ft.querySelector(".fold-arrow").textContent = open ? "▾" : "▸";
+    return;
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const c = e.target && e.target.closest ? e.target.closest("[data-ev]") : null;
+    if (c) feedSheet(c.dataset.ev);
   }
 });
 
@@ -176,15 +213,8 @@ function renderToday() {
     ${stalled.length ? `
     <h2 style="margin-top:4px">Needs attention</h2>
     <p class="sub">Stalled — no feed activity in 3+ days</p>
-    <div class="card" style="padding:8px 16px;margin-bottom:16px">
-      ${stalled.map((t) => `
-        <div class="stall-row" data-ev="${esc(t.id)}">
-          <div style="flex:1;min-width:0"><b>${esc(t.title)}</b>
-            <div class="meta">W${t.week} · ${esc(t.role)}</div></div>
-          <span class="stall-days">${t.days_quiet}d quiet</span>
-        </div>`).join("")}
-    </div>` : ""}
-    ${roleBlocks(wk.roles)}
+    ${foldCards(stalled.map((t) => taskCard(t, `W${t.week} · ${esc(t.role)}`)))}` : ""}
+    ${roleBlocks(wk.roles, true)}
     <h2 style="margin-top:24px">KPI glance</h2>
     <p class="sub">Week ${d.current_week} targets vs actuals</p>
     ${d.kpis.map(kpiGlance).join("")}`;
@@ -278,6 +308,7 @@ async function renderPeople() {
     <p class="sub">Stakeholders across this run’s threads — tap to expand</p>
     ${list.length ? `<div class="card" style="padding:8px 16px">` + list.map((s, i) => `
       <div class="person-row" data-person="${i}">
+        ${avatarHtml(s.name ? `${s.name} <${s.email}>` : s.email, 34)}
         <div style="flex:1;min-width:0"><b>${esc(s.name)}</b>
           <div class="meta">${esc(s.email)}</div></div>
         <span class="meta">${s.threads.length} thread${s.threads.length === 1 ? "" : "s"} · ${s.tasks.length} task${s.tasks.length === 1 ? "" : "s"}</span>
@@ -525,7 +556,8 @@ function metaLine(l) {
     return `event · ${m.starts_at.slice(0, 16).replace("T", " ")}`;
   }
   const bits = [l.kind];
-  if (m.from) bits.push(m.from);
+  // Prefer the display name; the avatar tooltip carries the raw address.
+  if (m.from) bits.push(addrParts(m.from).name || m.from);
   if (m.date) bits.push(m.date);
   if (m.count) bits.push(m.count + (m.count === 1 ? " message" : " messages"));
   if (m.unseen > 0) bits.push(`${m.unseen} new`);
@@ -533,11 +565,61 @@ function metaLine(l) {
 }
 
 function linkRow(l) {
+  const av = (l.source === "email-imap" && (l.kind === "thread" || l.kind === "message"))
+    ? threadAvatars(l) : "";
   return `<div class="link-row">
-    ${srcBadge(l.source)}
+    ${av}${srcBadge(l.source)}
     <div class="link-body"><b>${esc(l.label)}</b><div class="meta">${esc(metaLine(l))}</div></div>
     <button class="btn ghost small" data-unlink="${esc(l.id)}">Remove</button>
   </div>`;
+}
+
+/* ---------- contact avatars ---------- */
+const AV_COLORS = ["#c9a227", "#57b883", "#6aa8ff", "#9b7ede", "#4fb8a8", "#b08968"];
+function avColor(email) {
+  let h = 0;
+  const s = String(email || "").toLowerCase();
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return AV_COLORS[h % AV_COLORS.length];
+}
+function addrParts(s) {
+  const m = String(s || "").match(/^(.*?)<([^<>]+)>\s*$/);
+  if (m) return { name: m[1].trim().replace(/^["']|["']$/g, ""), email: m[2].trim() };
+  return { name: "", email: String(s || "").trim() };
+}
+function avInitials(name, email) {
+  if (name) {
+    const w = name.split(/\s+/).filter(Boolean);
+    if (w.length) return (w[0][0] + (w[1] ? w[1][0] : "")).toUpperCase();
+  }
+  const u = email.split("@")[0].replace(/[^a-z0-9]/gi, "");
+  return (u.slice(0, 2) || "?").toUpperCase();
+}
+function avatarHtml(addr, size) {
+  size = size || 30;
+  const { name, email } = addrParts(addr);
+  if (!email || !email.includes("@")) return "";
+  return `<span class="avatar" style="width:${size}px;height:${size}px;` +
+    `font-size:${Math.round(size * 0.36)}px;background:${avColor(email)}" ` +
+    `title="${esc(name || email)}">${esc(avInitials(name, email))}</span>`;
+}
+/** Overlapping avatar stack for a thread link's participants (from/to). */
+function threadAvatars(l) {
+  const m = l.meta || {};
+  const tos = Array.isArray(m.to) ? m.to : [];
+  const seen = new Set(), uniq = [];
+  for (const a of [m.from, m.last_from, ...tos]) {
+    const { email } = addrParts(a);
+    const k = email.toLowerCase();
+    if (k.includes("@") && !seen.has(k)) { seen.add(k); uniq.push(a); }
+    if (uniq.length >= 3) break;
+  }
+  if (!uniq.length) return "";
+  const extra = new Set(
+    [m.from, m.last_from, ...tos].map((a) => addrParts(a).email.toLowerCase())
+      .filter((e) => e.includes("@"))).size - uniq.length;
+  return `<span class="avatar-stack">${uniq.map((a) => avatarHtml(a)).join("")}` +
+    `${extra > 0 ? `<span class="avatar avatar-more" title="${extra} more">+${extra}</span>` : ""}</span>`;
 }
 
 async function feedSheet(taskId) {
@@ -546,23 +628,42 @@ async function feedSheet(taskId) {
   const links = task.links || [];
   const hasThreads = links.some((l) => l.source === "email-imap" && l.kind === "thread");
   openSheet(`
-    <div style="display:flex;align-items:center;justify-content:space-between">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
       <h3 style="margin:0">Feed</h3>
-      ${hasThreads ? `<button class="btn ghost small" id="f-sync">Sync</button>` : ""}
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost small" id="f-toggle">${task.done ? "Reopen" : "Mark done"}</button>
+        ${hasThreads ? `<button class="btn ghost small" id="f-sync">Sync</button>` : ""}
+      </div>
     </div>
     <p class="meta" style="color:var(--muted);font-size:13px;margin:6px 0 12px">${esc(task.title)}</p>
     <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">Nothing in the feed yet.</div>`}</div>
-    <h3 style="margin-top:20px">Add to feed</h3>
-    <div class="pills" id="ev-src">
-      <button class="pill active" data-evsrc="email">Email</button>
-      <button class="pill" data-evsrc="assign">Assign</button>
-      <button class="pill" data-evsrc="meeting">Meeting</button>
-      <button class="pill" data-evsrc="manual">Manual note</button>
-      <button class="pill" data-evsrc="webhook">Webhook</button>
+    <button class="fold-toggle" id="f-addtoggle" data-foldtoggle="f-addbody" aria-expanded="false">
+      <span>Add to feed</span><span class="fold-arrow">▸</span>
+    </button>
+    <div id="f-addbody" hidden>
+      <div class="pills" id="ev-src">
+        <button class="pill active" data-evsrc="email">Email</button>
+        <button class="pill" data-evsrc="assign">Assign</button>
+        <button class="pill" data-evsrc="meeting">Meeting</button>
+        <button class="pill" data-evsrc="manual">Manual note</button>
+        <button class="pill" data-evsrc="webhook">Webhook</button>
+      </div>
+      <div id="ev-form"></div>
     </div>
-    <div id="ev-form"></div>
     <div class="sheet-actions"><button class="btn ghost" id="f-cancel">Done</button></div>`);
   $("#f-cancel").onclick = closeSheet;
+  $("#f-toggle").onclick = async () => {
+    try {
+      await api(`/api/runs/${state.runId}/tasks/${taskId}/toggle`, "POST");
+      await loadDash();
+      feedSheet(taskId);
+    } catch (e) { alert(e.message); }
+  };
+  let addInit = false;
+  $("#f-addtoggle").addEventListener("click", () => {
+    // capture phase runs before the global toggle handler opens the body
+    if (!addInit && $("#f-addbody").hidden) { addInit = true; evForm(taskId, "email"); }
+  }, true);
   const syncBtn = $("#f-sync");
   if (syncBtn) syncBtn.onclick = async () => {
     syncBtn.disabled = true;
@@ -582,7 +683,6 @@ async function feedSheet(taskId) {
     $$("#ev-src .pill").forEach((x) => x.classList.toggle("active", x === b));
     evForm(taskId, b.dataset.evsrc);
   }));
-  evForm(taskId, "email");
   $$("#ev-list [data-unlink]").forEach((b) => b.addEventListener("click", () =>
     removeFromFeed(taskId, b.dataset.unlink)));
   // Opening the feed marks its threads read (clears unread dots on next render).

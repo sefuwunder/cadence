@@ -111,6 +111,23 @@ export function parseAddr(s: any): { email: string; name: string } | null {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str) ? { email: str.toLowerCase(), name: "" } : null;
 }
 
+/** Harvest raw address strings ("Name <email>" or bare) into email_contacts.
+ *  Keeps the first-seen name; always refreshes last_used. */
+export function harvestContacts(db: Database, addrs: any[]) {
+  const now = new Date().toISOString();
+  const up = db.prepare(
+    "INSERT INTO email_contacts (email, name, last_used) VALUES (?, ?, ?) " +
+    "ON CONFLICT(email) DO UPDATE SET last_used = excluded.last_used, " +
+    "name = CASE WHEN email_contacts.name = '' THEN excluded.name ELSE email_contacts.name END");
+  const run = db.transaction((list: any[]) => {
+    for (const a of list) {
+      const p = parseAddr(a);
+      if (p) up.run(p.email, p.name, now);
+    }
+  });
+  run(addrs || []);
+}
+
 // ---------- stakeholders ----------
 // Per-counterparty rollup: threads + tasks involving each email address,
 // built from email_contacts and thread-link meta (from/to). Exported so
@@ -203,6 +220,7 @@ export async function syncRunFeeds(
         config, fetchMessages: threadFetcher,
       });
       db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify(r.meta), l.id]);
+      harvestContacts(db, r.harvest);
       synced++; newReplies += r.newCount;
     } catch (e: any) { if (!firstErr) firstErr = e?.message || "thread sync failed"; }
   }
@@ -468,6 +486,11 @@ export function createApp(opts: {
           "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 500),
            JSON.stringify(meta), new Date().toISOString()]);
+        // Harvest contacts from linked email threads (from + recipients).
+        if (source === "email-imap") {
+          const tos = Array.isArray(meta.to) ? meta.to : [];
+          harvestContacts(db, [meta.from, meta.last_from, ...tos]);
+        }
         return json({ id }, 201);
       }
       pm = path.match(/^\/api\/links\/([^/]+)$/);
@@ -489,6 +512,7 @@ export function createApp(opts: {
           config, fetchMessages: opts.threadFetcher,
         });
         db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify(r.meta), l.id]);
+        harvestContacts(db, r.harvest);
         return r;
       };
       const threadLinksForTask = (taskId: string) => db.query(
