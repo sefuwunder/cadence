@@ -178,6 +178,169 @@ export async function searchThreads(opts: {
   }
 }
 
+// ---------- inbound thread sync ----------
+// Pulls replies into a linked thread (task_links row, kind=thread).
+// Diffs MESSAGE-IDs against meta.seen_ids; the first sync seeds seen_ids
+// silently (old mail isn't "new"). meta gains: seen_ids, unseen
+// (accumulated), count, last_from, last_date, last_snippet.
+
+export interface ThreadMessage {
+  messageId: string; // "" when the message has none — falls back to a date/from/subject key
+  from: string;
+  date: string;      // YYYY-MM-DD (INTERNALDATE)
+  subject: string;
+  snippet: string;   // first ~140 chars of body text, tags stripped
+}
+
+export interface ThreadSyncResult {
+  meta: Record<string, any>;
+  newCount: number;
+  seeded: boolean;
+}
+
+function msgKey(m: ThreadMessage): string {
+  return m.messageId || `~${m.date}|${m.from}|${m.subject}`.toLowerCase();
+}
+
+export async function syncThread(opts: {
+  link: { ref: string; label: string; meta?: any };
+  config: any;
+  fetchMessages?: (subject: string) => Promise<ThreadMessage[]>;
+}): Promise<ThreadSyncResult> {
+  const meta = { ...(opts.link.meta || {}) };
+  const subject = opts.link.label || opts.link.ref;
+  const fetchImpl = opts.fetchMessages || ((s: string) => imapFetchThreadMessages(s, opts.config));
+  const msgs = (await fetchImpl(subject)).slice()
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  const newest = msgs[0];
+  const ids = msgs.map(msgKey);
+  const prevSeen: string[] = Array.isArray(meta.seen_ids) ? meta.seen_ids : [];
+  if (!meta.seen_ids) {
+    return {
+      meta: {
+        ...meta, seen_ids: ids, unseen: 0, count: msgs.length,
+        last_from: newest?.from || meta.from || "",
+        last_date: newest?.date || meta.date || "",
+        last_snippet: newest?.snippet || "",
+      },
+      newCount: 0, seeded: true,
+    };
+  }
+  const seenSet = new Set(prevSeen);
+  const fresh = msgs.filter((m) => !seenSet.has(msgKey(m)));
+  const freshIds = fresh.map(msgKey).filter((k) => !seenSet.has(k));
+  return {
+    meta: {
+      ...meta, seen_ids: [...prevSeen, ...freshIds],
+      unseen: (Number(meta.unseen) || 0) + fresh.length, count: msgs.length,
+      last_from: newest?.from || meta.last_from || "",
+      last_date: newest?.date || meta.last_date || "",
+      last_snippet: newest?.snippet || meta.last_snippet || "",
+    },
+    newCount: fresh.length, seeded: false,
+  };
+}
+
+/** Reassemble a multi-literal UID FETCH response into per-message payloads.
+ *  The connection reader joins each {n} literal to its command line with "\n",
+ *  so one FETCH reply can arrive as several "lines": the head line plus one
+ *  continuation line per literal. */
+function parseThreadFetch(lines: string[]): ThreadMessage[] {
+  const out: ThreadMessage[] = [];
+  let cur: { date: string; payloads: { kind: "hdr" | "body"; text: string }[] } | null = null;
+  const pushPayload = (line: string) => {
+    const nl = line.indexOf("\n");
+    if (nl < 0 || !cur) return;
+    const marker = line.slice(0, nl);
+    const kind = /HEADER\.FIELDS/i.test(marker) ? "hdr" : "body";
+    cur.payloads.push({ kind, text: line.slice(nl + 1) });
+  };
+  const flush = () => {
+    if (!cur) return;
+    if (!cur.payloads.length) { cur = null; return; } // degenerate FETCH line — nothing to parse
+    const hdr = cur.payloads.find((p) => p.kind === "hdr")?.text || "";
+    const body = cur.payloads.find((p) => p.kind === "body")?.text || "";
+    const headers: Record<string, string> = {};
+    let acc = "";
+    const take = () => {
+      if (!acc) return;
+      const c = acc.indexOf(":");
+      if (c > 0 && !(acc.slice(0, c).toLowerCase() in headers)) {
+        headers[acc.slice(0, c).toLowerCase()] = acc.slice(c + 1).trim();
+      }
+      acc = "";
+    };
+    for (const hl of hdr.split(/\r?\n/)) {
+      if (/^[ \t]/.test(hl) && acc) acc += " " + hl.trim();
+      else { take(); acc = hl.trim(); }
+    }
+    take();
+    out.push({
+      messageId: decodeHeader(headers["message-id"] || "").replace(/^<|>$/g, "").trim(),
+      from: decodeHeader(headers["from"] || ""),
+      date: cur.date,
+      subject: decodeHeader(headers["subject"] || ""),
+      snippet: body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 140),
+    });
+    cur = null;
+  };
+  for (const l of lines) {
+    if (/^\* \d+ FETCH/i.test(l)) {
+      flush();
+      const im = l.match(/INTERNALDATE "([^"]+)"/i);
+      cur = { date: im ? internalDateToIso(im[1]) : "", payloads: [] };
+      pushPayload(l);
+    } else if (cur && l.includes("\n")) {
+      pushPayload(l);
+    }
+  }
+  flush();
+  return out;
+}
+
+/** Default fetcher: SUBJECT-search INBOX + Sent, newest first. Read-only. */
+async function imapFetchThreadMessages(subject: string, config: any): Promise<ThreadMessage[]> {
+  const cfg = await resolveConfig(config); // throws human-readable ImapError when missing
+  const conn = new Conn();
+  await conn.open(cfg.host, cfg.port);
+  try {
+    const greet = await conn.greeting();
+    if (!/^\* OK/i.test(greet)) throw new ImapError("imap server did not greet");
+    await authenticate(conn, "s001", cfg);
+    const sent = cfg.folder || (await findSentFolder(conn));
+    const folders = [...new Set(["INBOX", sent].filter(Boolean) as string[])];
+    const byKey = new Map<string, ThreadMessage>();
+    const ascii = /^[\x00-\x7F]*$/.test(subject);
+    let n = 0;
+    for (const folder of folders) {
+      const tag = `s1${n}`;
+      await conn.cmd(`${tag}a`, `EXAMINE ${qstr(folder)}`); // read-only
+      const sLines = await conn.cmd(`${tag}b`, ascii
+        ? `UID SEARCH SUBJECT ${qstr(subject)}`
+        : `UID SEARCH CHARSET UTF-8 SUBJECT ${qstr(subject)}`);
+      let uids: string[] = [];
+      for (const l of sLines) {
+        const m = l.match(/^\* SEARCH\s*(.*)$/i);
+        if (m && m[1].trim()) uids.push(...m[1].trim().split(/\s+/));
+      }
+      uids = uids.slice(-200);
+      for (let i = 0; i < uids.length; i += 100) {
+        const chunk = uids.slice(i, i + 100);
+        const fl = await conn.cmd(`${tag}c`,
+          `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (MESSAGE-ID FROM DATE SUBJECT)] BODY[TEXT]<0.500>)`);
+        for (const m of parseThreadFetch(fl)) {
+          const k = msgKey(m);
+          if (!byKey.has(k)) byKey.set(k, m);
+        }
+      }
+      n++;
+    }
+    return [...byKey.values()];
+  } finally {
+    conn.close();
+  }
+}
+
 class Conn {
   private buf = Buffer.alloc(0);
   private lines: string[] = [];
@@ -454,7 +617,7 @@ export const connector = {
 };
 
 // Exported for tests (pure helpers, no network).
-export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob };
+export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob, parseThreadFetch };
 
 /** APPEND a raw RFC 5322 message to the Sent folder (files a sent message so
  *  it shows up in sent-mail and in later thread searches). Read-write, unlike

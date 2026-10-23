@@ -75,13 +75,14 @@ a `task_links` row (`source: email-imap, kind: thread`, ref = normalized
 subject) is created. Sending is always user-initiated from the task feed —
 the Send button is the confirmation; nothing auto-sends anywhere.
 
-## The three built-ins
+## The four built-ins
 
 | id | mode | notes |
 |----|------|-------|
 | `manual` | no-op | Metrics entered by hand; `sync()` returns `[]`. |
 | `email-imap` | poll + thread search + **send** | Counts Sent-folder messages per day; also powers email-thread feed linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping) and Assign-from-feed sending (`POST /api/connectors/email-imap/send`). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, `data/imap.json` (gitignored), or GNOME Online Accounts (`goa_account` selection; OAuth2 → XOAUTH2, creds never stored). Read-only, except Sent-filing after a send. |
 | `webhook` | inbound | External systems `POST /api/hooks/:key` with `{kpi_id, date, value, note}`. Keys live in its connector config: `{keys: {"<uuid>": {"label": "..."}}}`. `sync()` is a no-op. |
+| `calendar-ical` | poll | Counts events per day from an iCal URL whose SUMMARY matches `query` (empty query = all events). Config: `url` (masked in the UI) via connector config, `CALENDAR_ICAL_URL` env, or `data/calendar.json` (gitignored); optional `query`/`CALENDAR_QUERY`. Minimal zero-dep VEVENT parse (UID, SUMMARY, DTSTART/DTEND as UTC/floating/all-day; ICS parser ported from docket's `src/ical.js`). **RRULE is not expanded in v1** — recurring events contribute only their base instance. Powers the Meeting pill in the task feed (`GET /api/connectors/calendar-ical/events?from=&to=[&q=]`). |
 
 ## Testing a new connector
 
@@ -89,4 +90,8 @@ Add cases to `tests/api.test.ts`:
 
 1. `sync()` against a stub (never a live service in tests).
 2. Config-missing error message is human-readable.
-3. Returned rows validate: `date` matches `^\d{4}-\d{2}-\d{2}$`, `value` is finite.
+3. Returned rows validate: `date` matches `^\\d{4}-\\d{2}-\\d{2}$`, `value` is finite.
+
+## Inbound thread sync (`email-imap`)
+
+`syncThread({ link: { ref, label, meta }, config, fetchMessages? })` pulls replies into a linked thread: SUBJECT-searches INBOX + Sent (read-only `EXAMINE`), fetches headers + a body snippet, and diffs MESSAGE-IDs against `meta.seen_ids`. The first sync seeds `seen_ids` silently (old mail isn't "new"); later syncs accumulate `meta.unseen` and refresh `last_from`/`last_date`/`last_snippet`/`count`. Pass `fetchMessages` in tests to avoid the network; `createApp` accepts a `threadFetcher` override for the same reason. Routes: `POST /api/runs/:id/tasks/:taskId/sync-feed`, `POST /api/runs/:id/sync-feeds` (cap 20, most-recently-active first), `POST /api/runs/:id/tasks/:taskId/feed/read` (zeroes `unseen`).

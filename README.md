@@ -14,7 +14,7 @@ opens into a two-pane layout on tablet (≥900px).
 cd cadence
 bun install   # no-op: zero dependencies, but keeps bun happy
 bun start     # → http://127.0.0.1:3040
-bun test          # 58 tests, all green
+bun test          # 83 tests, all green
 ```
 
 Data lives in `data/cadence.db` (created on first run). Override with `CADENCE_DATA_DIR`.
@@ -25,10 +25,14 @@ Hit **+** in the top bar to start a run from it.
 ## Tabs
 
 - **Today** — this week's tasks grouped by role, checkboxes; KPI glance for the week.
+  A **Needs attention** section tops the view with stalled tasks (no feed activity
+  in 3+ days, current/past weeks only).
 - **Playbook** — week selector (W1–W4), role swimlanes with completion counts.
 - **KPIs** — cards with per-week target/actual bars, manual log, per-connector sync,
   and a Connectors section for setup.
 - **Activity** — feed: task completions + metric entries with source badges.
+- **People** — stakeholder rollup: every counterparty across the run's email
+  threads, expandable to their threads (tap to open that task's feed) and tasks.
 
 ## Task feed
 
@@ -41,6 +45,14 @@ webhook records) with source badges, plus unlink buttons.
   no JWZ). Linking a thread stores one row (`kind: thread`, ref = the normalized
   subject, meta carries from/date/message count). One row per thread, manual
   linking only (no auto-rules in v1).
+- **Inbound reply ingestion** — the feed sheet has a **Sync** button that pulls
+  replies into each linked thread: IMAP SUBJECT-searches INBOX + Sent, diffs
+  MESSAGE-IDs against `meta.seen_ids`, and accumulates `meta.unseen`. The first
+  sync seeds `seen_ids` silently (old mail isn't "new"); opening a feed marks its
+  threads read. Tasks with unread replies show a gold dot.
+  `POST /api/runs/:runId/tasks/:taskId/sync-feed`,
+  `POST /api/runs/:runId/sync-feeds` (all threads, 20 most-recently-active),
+  `POST /api/runs/:runId/tasks/:taskId/feed/read`.
 - **Assign from feed** — start an email thread with contact(s) right from the
   task: To (comma-separated, with a datalist of recent contacts), Subject
   (prefilled with the task title), Message, Send. The message goes out through
@@ -52,12 +64,32 @@ webhook records) with source badges, plus unlink buttons.
   (`email_contacts`, most-recently-used first). Sending is always user-initiated
   — the Send button is the confirmation; nothing auto-sends.
 - **Manual note** — free-text note linked as `source: manual, kind: note`.
+- **Meeting** — link a calendar event from the iCal feed: date-bounded search
+  (optional SUMMARY filter) → Add. Stored as `source: calendar-ical,
+  kind: event`, ref = event UID, meta carries `starts_at`/`ends_at`.
 - **Webhook** — any system can post to a task’s feed: `POST /api/hooks/:key`
   `{ "task_id", "kind", "ref", "label", "meta"? }`.
 
 `task_links` table: `id, task_id, source, kind, ref, label, meta_json, created_at`.
 `source` is the connector id (also the UI badge); `kind` is
-`thread`/`message`/`note`/`record`; `ref` is the source's identifier.
+`thread`/`message`/`note`/`record`/`event`; `ref` is the source's identifier.
+
+### Stalled tasks
+
+A task is **stalled** when it's incomplete and its latest feed activity (max of
+link `created_at` and thread `meta.last_date`) is 3+ days old (`STALL_DAYS` in
+`src/server.ts` — a const today, a per-run setting is the natural next step).
+Tasks with no feed activity never stall by this rule. The dashboard carries
+`stalled`/`days_quiet` per task; Today lists stalled tasks (current/past weeks)
+under "Needs attention". Pure date math, no AI.
+
+### People
+
+`GET /api/stakeholders?run_id=` rolls every counterparty up from
+`email_contacts` + thread-link meta (`from`/`to`): `[{email, name, last_used,
+threads: [{task_id, task_title, subject, last_date, unseen}],
+tasks: [{task_id, title, role, week}]}]`, sorted by recency (thread count, then
+email, break ties).
 
 ## Connectors
 
@@ -88,6 +120,7 @@ Built-ins:
 | `manual` | no-op (manual entry is native) | none |
 | `email-imap` | counts messages in the Sent folder per day via `INTERNALDATE` | env `CADENCE_IMAP_HOST/PORT/USER/PASS/FOLDER`, or `data/imap.json` (gitignored), or the in-app setup form, or **GNOME Online Accounts** (see below) |
 | `webhook` | **inbound**: `POST /api/hooks/:key` `{kpi_id, date, value, note?}` | keys managed in the in-app connector setup; invalid key → 401 |
+| `calendar-ical` | counts matching events per day from an iCal URL | `CALENDAR_ICAL_URL` env, `data/calendar.json` (gitignored), or the in-app setup form (URL field is masked); optional SUMMARY `query` filter |
 
 The IMAP client is read-only (`EXAMINE`, never `SELECT`), opens one TLS connection
 per sync, and resolves the Sent folder by `LIST` name matching (`*sent*`, `*gesendet*`,
@@ -117,7 +150,18 @@ GET                 /api/runs/:id             → dashboard payload (weeks, task
 POST                /api/runs/:id/tasks/:taskId/toggle
 POST                /api/runs/:id/tasks/:taskId/links  {source?, kind?, ref?, label, meta?} → 201
 DELETE              /api/links/:linkId                → 204
-                      (tasks in the dashboard payload carry links[])
+                      (tasks in the dashboard payload carry links[] plus
+                      unread / stalled / days_quiet)
+POST                /api/runs/:id/tasks/:taskId/sync-feed   → { threads, synced, new_replies }
+POST                /api/runs/:id/sync-feeds               → same, all threads (cap 20, most-recently-active)
+POST                /api/runs/:id/tasks/:taskId/feed/read  → { ok: true } (zeroes unseen)
+GET                 /api/stakeholders?run_id=         → { stakeholders: [{ email, name, last_used,
+                                                          threads: [{ task_id, task_title, subject,
+                                                                      last_date, unseen }],
+                                                          tasks: [{ task_id, title, role, week }] }] }
+GET                 /api/connectors/calendar-ical/events?from=&to=[&q=]
+                      → { events: [{ uid, summary, starts_at, ends_at, recurring? }] }
+                      (400 when no iCal URL is configured)
 GET                 /api/connectors/email-imap/threads?q=…[&folder=…]
                       → { threads: [{ thread_key, subject, from, date, count }] }
                       (400 when IMAP is unconfigured)

@@ -3,9 +3,10 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { createApp } from "../src/server.ts";
+import { createApp, STALL_DAYS, stallStatus, parseAddr } from "../src/server.ts";
 import { connectors } from "../src/connectors/index.ts";
-import { _test as imapTest } from "../src/connectors/email-imap.ts";
+import { _test as imapTest, syncThread } from "../src/connectors/email-imap.ts";
+import { _test as calTest } from "../src/connectors/calendar-ical.ts";
 import { keyIsValid } from "../src/connectors/webhook.ts";
 import { listGoaMailAccounts, getGoaCredentials, goaImapCfg, goaAvailable, goaSmtpCfg } from "../src/goa.ts";
 import { _test as smtpTest, resolveSmtpConfig } from "../src/connectors/email-smtp.ts";
@@ -147,11 +148,11 @@ describe("runs + dashboard", () => {
 });
 
 describe("connectors", () => {
-  test("registry lists the three built-ins", async () => {
+  test("registry lists the four built-ins", async () => {
     const { status, data } = await call("GET", "/api/connectors");
     expect(status).toBe(200);
-    expect(data.map((c: any) => c.id).sort()).toEqual(["email-imap", "manual", "webhook"]);
-    expect(connectors.size).toBe(3);
+    expect(data.map((c: any) => c.id).sort()).toEqual(["calendar-ical", "email-imap", "manual", "webhook"]);
+    expect(connectors.size).toBe(4);
   });
 
   test("connector config save + read", async () => {
@@ -807,5 +808,405 @@ describe("assign from feed (send endpoint)", () => {
     expect(emails[0]).toBe("a@x.com");
     expect(emails).toContain("b@x.com");
     expect(new Set(emails).size).toBe(emails.length);
+  });
+});
+
+describe("thread sync (syncThread)", () => {
+  const M = (over: any = {}) => ({
+    messageId: "m1", from: "jane@acme.com", date: "2026-10-20",
+    subject: "Re: Kickoff", snippet: "hello", ...over,
+  });
+
+  test("first sync seeds seen_ids silently", async () => {
+    const r = await syncThread({
+      link: { ref: "kickoff", label: "Re: Kickoff", meta: { from: "jane@acme.com", date: "2026-10-20", count: 2 } },
+      config: {},
+      fetchMessages: async () => [M({ messageId: "m3", date: "2026-10-22" }), M({ messageId: "m2", date: "2026-10-21" }), M()],
+    });
+    expect(r.seeded).toBe(true);
+    expect(r.newCount).toBe(0);
+    expect(r.meta.unseen).toBe(0);
+    expect(r.meta.seen_ids).toHaveLength(3);
+    expect(r.meta.count).toBe(3);
+    expect(r.meta.last_from).toBe("jane@acme.com");
+    expect(r.meta.last_date).toBe("2026-10-22");
+  });
+
+  test("second sync detects only new replies", async () => {
+    const seed = await syncThread({
+      link: { ref: "kickoff", label: "Kickoff", meta: {} }, config: {},
+      fetchMessages: async () => [M(), M({ messageId: "m2" })],
+    });
+    const r = await syncThread({
+      link: { ref: "kickoff", label: "Kickoff", meta: seed.meta }, config: {},
+      fetchMessages: async () => [
+        M({ messageId: "m4", date: "2026-10-23", from: "boss@corp.com", snippet: "approved" }),
+        M(), M({ messageId: "m2" }),
+      ],
+    });
+    expect(r.seeded).toBe(false);
+    expect(r.newCount).toBe(1);
+    expect(r.meta.unseen).toBe(1);
+    expect(r.meta.last_from).toBe("boss@corp.com");
+    expect(r.meta.last_date).toBe("2026-10-23");
+    expect(r.meta.last_snippet).toBe("approved");
+    // unseen accumulates across syncs
+    const r2 = await syncThread({
+      link: { ref: "kickoff", label: "Kickoff", meta: r.meta }, config: {},
+      fetchMessages: async () => [M({ messageId: "m5", date: "2026-10-24" }), M({ messageId: "m4", date: "2026-10-23" }), M(), M({ messageId: "m2" })],
+    });
+    expect(r2.meta.unseen).toBe(2);
+  });
+
+  test("messages without message-id still diff via fallback key", async () => {
+    const noId = () => M({ messageId: "", from: "x@y.com", date: "2026-10-20", subject: "S" });
+    const seed = await syncThread({
+      link: { ref: "s", label: "S", meta: {} }, config: {},
+      fetchMessages: async () => [noId()],
+    });
+    const r = await syncThread({
+      link: { ref: "s", label: "S", meta: seed.meta }, config: {},
+      fetchMessages: async () => [noId()],
+    });
+    expect(r.newCount).toBe(0);
+    expect(r.meta.unseen).toBe(0);
+  });
+
+  test("parseThreadFetch reassembles multi-literal FETCH", () => {
+    const hdr = "Message-ID: <a@x>\r\nFrom: Jane Doe <jane@acme.com>\r\nSubject: =?UTF-8?Q?Kickoff?=\r\n";
+    const body = "Hello <b>world</b> bye";
+    const lines = [
+      `* 1 FETCH (UID 5 INTERNALDATE "22-Oct-2026 10:00:00 +0000" BODY[HEADER.FIELDS (MESSAGE-ID FROM DATE SUBJECT)] {${hdr.length}}\n${hdr}`,
+      ` BODY[TEXT]<0> {${body.length}}\n${body}`,
+      ")",
+    ];
+    const [m] = imapTest.parseThreadFetch(lines);
+    expect(m.messageId).toBe("a@x");
+    expect(m.from).toBe("Jane Doe <jane@acme.com>");
+    expect(m.date).toBe("2026-10-22");
+    expect(m.subject).toBe("Kickoff");
+    expect(m.snippet).toBe("Hello world bye");
+    expect(imapTest.parseThreadFetch(["* 2 FETCH (UID 6 INTERNALDATE \"bad\")"])).toEqual([]);
+  });
+});
+
+describe("feed sync endpoints", () => {
+  let app3: ReturnType<typeof createApp>;
+  let tmp3: string;
+  let run3 = "", task3 = "";
+  let fetchCalls = 0;
+  let stubMsgs: any[] = [];
+  const M = (over: any = {}) => ({
+    messageId: "m1", from: "jane@acme.com", date: "2026-10-20",
+    subject: "Re: Kickoff", snippet: "hi", ...over,
+  });
+
+  async function call3(method: string, path: string, body?: any) {
+    const res = await app3.fetch(new Request(`http://localhost${path}`, {
+      method, headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }));
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  }
+
+  beforeAll(async () => {
+    tmp3 = mkdtempSync(join(tmpdir(), "cadence-sync-"));
+    app3 = createApp({
+      dbPath: join(tmp3, "test.db"),
+      threadFetcher: async (_subject: string) => { fetchCalls++; return stubMsgs; },
+    });
+    const pb = await call3("GET", "/api/playbooks");
+    const r = await call3("POST", "/api/runs", {
+      playbook_id: pb.data[0].id, name: "Sync run", start_date: today(),
+    });
+    run3 = r.data.id;
+    const dash = await call3("GET", `/api/runs/${run3}`);
+    task3 = dash.data.weeks[0].roles.CEO[0].id;
+  });
+  afterAll(() => { app3.close(); rmSync(tmp3, { recursive: true, force: true }); });
+
+  const addThread = (taskId: string, meta: any = {}) => call3(
+    "POST", `/api/runs/${run3}/tasks/${taskId}/links`,
+    { source: "email-imap", kind: "thread", ref: "kickoff", label: "Re: Kickoff", meta });
+
+  test("sync-feed 404s for unknown task / wrong run", async () => {
+    expect((await call3("POST", `/api/runs/${run3}/tasks/nope/sync-feed`)).status).toBe(404);
+    expect((await call3("POST", `/api/runs/${run3}/tasks/nope/feed/read`)).status).toBe(404);
+    expect((await call3("POST", `/api/runs/nope/tasks/${task3}/feed/read`)).status).toBe(404);
+  });
+
+  test("sync-feed with no threads is a no-op", async () => {
+    const r = await call3("POST", `/api/runs/${run3}/tasks/${task3}/sync-feed`);
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ threads: 0, synced: 0, new_replies: 0 });
+  });
+
+  test("sync-feed seeds then detects replies; unread dot; feed/read clears", async () => {
+    stubMsgs = [M(), M({ messageId: "m2", date: "2026-10-21" })];
+    await addThread(task3);
+    const s1 = await call3("POST", `/api/runs/${run3}/tasks/${task3}/sync-feed`);
+    expect(s1.data).toMatchObject({ threads: 1, synced: 1, new_replies: 0 });
+    let dash = await call3("GET", `/api/runs/${run3}`);
+    let t = dash.data.weeks[0].roles.CEO[0];
+    expect(t.unread).toBe(false); // seed is silent
+
+    stubMsgs = [M({ messageId: "m3", date: "2026-10-22", from: "boss@corp.com", snippet: "looks good" }),
+      M(), M({ messageId: "m2", date: "2026-10-21" })];
+    const s2 = await call3("POST", `/api/runs/${run3}/tasks/${task3}/sync-feed`);
+    expect(s2.data).toMatchObject({ synced: 1, new_replies: 1 });
+    dash = await call3("GET", `/api/runs/${run3}`);
+    t = dash.data.weeks[0].roles.CEO[0];
+    expect(t.unread).toBe(true);
+    expect(t.links[0].meta.unseen).toBe(1);
+    expect(t.links[0].meta.last_from).toBe("boss@corp.com");
+
+    const rd = await call3("POST", `/api/runs/${run3}/tasks/${task3}/feed/read`);
+    expect(rd.status).toBe(200);
+    dash = await call3("GET", `/api/runs/${run3}`);
+    expect(dash.data.weeks[0].roles.CEO[0].unread).toBe(false);
+    expect(dash.data.weeks[0].roles.CEO[0].links[0].meta.unseen).toBe(0);
+  });
+
+  test("sync-feeds caps at 20 most-recently-active threads", async () => {
+    fetchCalls = 0;
+    stubMsgs = [M()];
+    for (let i = 0; i < 21; i++) await addThread(task3);
+    const r = await call3("POST", `/api/runs/${run3}/sync-feeds`);
+    expect(r.status).toBe(200);
+    expect(r.data.threads).toBe(20);
+    expect(fetchCalls).toBe(20);
+  });
+
+  test("sync-feeds 404s for unknown run", async () => {
+    expect((await call3("POST", "/api/runs/nope/sync-feeds")).status).toBe(404);
+  });
+});
+
+describe("sync-feed without IMAP configured", () => {
+  test("400s with the human-readable credentials error", async () => {
+    // main app has no threadFetcher and no IMAP config
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const tid = dash.data.weeks[0].roles.CEO[0].id;
+    await call("POST", `/api/runs/${runId}/tasks/${tid}/links`, {
+      source: "email-imap", kind: "thread", ref: "kickoff", label: "Re: Kickoff", meta: {},
+    });
+    const r = await call("POST", `/api/runs/${runId}/tasks/${tid}/sync-feed`);
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/missing IMAP credentials/);
+  });
+});
+
+describe("stall math", () => {
+  const now = Date.parse("2026-10-22T12:00:00Z");
+  const ago = (days: number) => new Date(now - days * 864e5).toISOString();
+
+  test("STALL_DAYS is 3", () => expect(STALL_DAYS).toBe(3));
+
+  test("boundary: exactly 3 days stalls, just under does not", () => {
+    expect(stallStatus(false, ago(3), now).stalled).toBe(true);
+    expect(stallStatus(false, ago(2.99), now).stalled).toBe(false);
+    expect(stallStatus(false, ago(10), now)).toMatchObject({ stalled: true, days_quiet: 10 });
+  });
+
+  test("done tasks and activity-free tasks never stall", () => {
+    expect(stallStatus(true, ago(30), now).stalled).toBe(false);
+    expect(stallStatus(false, null, now)).toMatchObject({ stalled: false, days_quiet: null });
+    expect(stallStatus(false, "not-a-date", now).stalled).toBe(false);
+  });
+
+  test("dashboard marks stalled tasks (old link activity, incomplete)", async () => {
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const tid = dash.data.weeks[0].roles.CEO[1].id;
+    // backdate a link directly: created_at 5 days ago, thread last_date 5 days ago
+    const old = new Date(Date.now() - 5 * 864e5).toISOString();
+    const oldDay = old.slice(0, 10);
+    app.db.run(
+      "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, 'manual', 'note', '', 'old note', ?, ?)",
+      [`stall-${Date.now()}`, tid, JSON.stringify({}), old]);
+    const d2 = await call("GET", `/api/runs/${runId}`);
+    const t = d2.data.weeks[0].roles.CEO.find((x: any) => x.id === tid);
+    expect(t.stalled).toBe(true);
+    expect(t.days_quiet).toBeGreaterThanOrEqual(5);
+    expect(t.unread).toBe(false);
+    // completing the task clears the stall
+    await call("POST", `/api/runs/${runId}/tasks/${tid}/toggle`);
+    const d3 = await call("GET", `/api/runs/${runId}`);
+    expect(d3.data.weeks[0].roles.CEO.find((x: any) => x.id === tid).stalled).toBe(false);
+    await call("POST", `/api/runs/${runId}/tasks/${tid}/toggle`); // untoggle
+  });
+});
+
+describe("stakeholders", () => {
+  test("requires run_id; 404s unknown run", async () => {
+    expect((await call("GET", "/api/stakeholders")).status).toBe(400);
+    expect((await call("GET", "/api/stakeholders?run_id=nope")).status).toBe(404);
+  });
+
+  test("aggregates threads + tasks per email, parses display names", async () => {
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const ceo0 = dash.data.weeks[0].roles.CEO[0].id;
+    const ceo2 = dash.data.weeks[0].roles.CEO[2].id;
+    await call("POST", `/api/runs/${runId}/tasks/${ceo0}/links`, {
+      source: "email-imap", kind: "thread", ref: "acme deal", label: "Re: Acme deal",
+      meta: { from: "Jane Doe <jane@acme.com>", to: ["boss@corp.com"], date: "2026-10-20", last_date: "2026-10-21", unseen: 2 },
+    });
+    await call("POST", `/api/runs/${runId}/tasks/${ceo2}/links`, {
+      source: "email-imap", kind: "thread", ref: "acme deal", label: "Acme deal",
+      meta: { from: "jane@acme.com", date: "2026-10-19", last_date: "2026-10-19" },
+    });
+    const r = await call("GET", `/api/stakeholders?run_id=${runId}`);
+    expect(r.status).toBe(200);
+    const jane = r.data.stakeholders.find((s: any) => s.email === "jane@acme.com");
+    expect(jane.name).toBe("Jane Doe");
+    expect(jane.threads).toHaveLength(2);
+    expect(jane.tasks).toHaveLength(2);
+    expect(jane.threads[0].unseen).toBe(2);
+    const boss = r.data.stakeholders.find((s: any) => s.email === "boss@corp.com");
+    expect(boss.threads).toHaveLength(1);
+    expect(boss.tasks).toHaveLength(1);
+    // sorted by recency
+    expect(r.data.stakeholders[0].email).toBe("jane@acme.com");
+  });
+
+  test("parseAddr handles display names, bare addresses, garbage", () => {
+    expect(parseAddr("Jane Doe <jane@acme.com>")).toEqual({ email: "jane@acme.com", name: "Jane Doe" });
+    expect(parseAddr("jane@acme.com")).toEqual({ email: "jane@acme.com", name: "" });
+    expect(parseAddr("JANE@ACME.COM")).toEqual({ email: "jane@acme.com", name: "" });
+    expect(parseAddr("not an email")).toBeNull();
+    expect(parseAddr("")).toBeNull();
+  });
+});
+
+describe("calendar-ical", () => {
+  const ICS = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//x//x//EN",
+    "BEGIN:VEVENT", "UID:evt-1",
+    "DTSTART:20261020T140000Z", "DTEND:20261020T150000Z",
+    "SUMMARY:Discovery call with Acme",
+    "END:VEVENT",
+    "BEGIN:VEVENT", "UID:evt-2",
+    "DTSTART:20261021T090000", "DTEND:20261021T093000",
+    "SUMMARY:Internal standup",
+    "END:VEVENT",
+    "BEGIN:VEVENT", "UID:evt-3",
+    "DTSTART;VALUE=DATE:20261022", "SUMMARY:Ship day",
+    "END:VEVENT",
+    "BEGIN:VEVENT", "UID:evt-4",
+    "DTSTART:20261023T100000Z",
+    "SUMMARY:A very long title that folds",
+    " across two lines",
+    "RRULE:FREQ=WEEKLY",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+
+  test("parseIcs: UTC, floating, all-day, folded lines, recurrence flagged", () => {
+    const evs = calTest.parseIcs(ICS);
+    expect(evs).toHaveLength(4);
+    const [utc, floating, allday, folded] = evs;
+    expect(utc.start.getTime()).toBe(Date.UTC(2026, 9, 20, 14, 0));
+    expect([floating.start.getFullYear(), floating.start.getMonth(), floating.start.getDate(),
+      floating.start.getHours(), floating.start.getMinutes()]).toEqual([2026, 9, 21, 9, 0]);
+    expect(allday.start.getHours()).toBe(0);
+    expect(allday.end.getTime() - allday.start.getTime()).toBe(864e5);
+    expect(folded.title).toBe("A very long title that foldsacross two lines"); // RFC 5545: the fold space is consumed
+    expect(folded.recurring).toBe(true);
+    expect(utc.recurring).toBe(false);
+  });
+
+  test("parseIcalDt rejects garbage", () => {
+    expect(calTest.parseIcalDt("not-a-date", {})).toBeNull();
+  });
+
+  test("filterEvents: date overlap + query", () => {
+    const evs = calTest.parseIcs(ICS);
+    const q = calTest.filterEvents(evs, "2026-10-19", "2026-10-21", "discovery");
+    expect(q.map((e) => e.uid)).toEqual(["evt-1"]);
+    const all = calTest.filterEvents(evs, "2026-10-19", "2026-10-23", "");
+    expect(all.map((e) => e.uid)).toEqual(["evt-1", "evt-2", "evt-3", "evt-4"]);
+    const none = calTest.filterEvents(evs, "2026-10-19", "2026-10-21", "zzz");
+    expect(none).toEqual([]);
+  });
+
+  test("resolveCalConfig: env fallback; throws without URL", () => {
+    expect(() => calTest.resolveCalConfig({})).toThrow(/no iCal URL/);
+    const prev = process.env.CALENDAR_ICAL_URL;
+    process.env.CALENDAR_ICAL_URL = "https://example.com/feed.ics";
+    try {
+      expect(calTest.resolveCalConfig({}).url).toBe("https://example.com/feed.ics");
+      expect(calTest.resolveCalConfig({ url: "https://x/y" }).url).toBe("https://x/y");
+    } finally {
+      if (prev === undefined) delete process.env.CALENDAR_ICAL_URL;
+      else process.env.CALENDAR_ICAL_URL = prev;
+    }
+  });
+
+  test("connector sync counts matching events per day (local feed)", async () => {
+    const srv = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch: () => new Response(ICS, { headers: { "content-type": "text/calendar" } }),
+    });
+    try {
+      const url = `http://127.0.0.1:${srv.port}/feed.ics`;
+      const conn = connectors.get("calendar-ical")!;
+      const rows = await conn.sync({ from: "2026-10-19", to: "2026-10-23", config: { url, query: "discovery" } });
+      expect(rows).toEqual([{ date: "2026-10-20", value: 1, note: "1 event" }]);
+      const all = await conn.sync({ from: "2026-10-19", to: "2026-10-23", config: { url } });
+      expect(all.length).toBe(4);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("events endpoint: 400 unconfigured, 200 with feed", async () => {
+    const bad = await call("GET", "/api/connectors/calendar-ical/events?from=2026-10-19&to=2026-10-23");
+    expect(bad.status).toBe(400);
+    expect((await call("GET", "/api/connectors/calendar-ical/events?from=xx&to=2026-10-23")).status).toBe(400);
+    const srv = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch: () => new Response(ICS, { headers: { "content-type": "text/calendar" } }),
+    });
+    try {
+      const url = `http://127.0.0.1:${srv.port}/feed.ics`;
+      await call("POST", "/api/connectors/calendar-ical", { config: { url } });
+      const r = await call("GET", "/api/connectors/calendar-ical/events?from=2026-10-19&to=2026-10-23&q=discovery");
+      expect(r.status).toBe(200);
+      expect(r.data.events).toHaveLength(1);
+      expect(r.data.events[0]).toMatchObject({ uid: "evt-1", summary: "Discovery call with Acme" });
+      expect(r.data.events[0].starts_at).toContain("2026-10-20");
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("meeting link round-trips into the feed", async () => {
+    const dash = await call("GET", `/api/runs/${runId}`);
+    const tid = dash.data.weeks[0].roles.CRO[0].id;
+    const r = await call("POST", `/api/runs/${runId}/tasks/${tid}/links`, {
+      source: "calendar-ical", kind: "event", ref: "evt-1", label: "Discovery call with Acme",
+      meta: { starts_at: "2026-10-20T14:00:00.000Z", ends_at: "2026-10-20T15:00:00.000Z" },
+    });
+    expect(r.status).toBe(201);
+    const d2 = await call("GET", `/api/runs/${runId}`);
+    const t = d2.data.weeks[0].roles.CRO[0];
+    expect(t.links.some((l: any) => l.source === "calendar-ical" && l.kind === "event")).toBe(true);
+  });
+
+  test("calendar sync stores metric entries via the generic route", async () => {
+    const srv = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch: () => new Response(ICS, { headers: { "content-type": "text/calendar" } }),
+    });
+    try {
+      const url = `http://127.0.0.1:${srv.port}/feed.ics`;
+      await call("POST", "/api/connectors/calendar-ical", { config: { url, query: "discovery" } });
+      const r = await call("POST", "/api/connectors/calendar-ical/sync", {
+        kpi_id: kpiId, from: "2026-10-19", to: "2026-10-23",
+      });
+      expect(r.status).toBe(200);
+      expect(r.data.inserted).toBe(1);
+    } finally {
+      srv.stop();
+    }
   });
 });

@@ -27,6 +27,7 @@ const TABS = [
   ["playbook", "▤", "Playbook"],
   ["kpis", "◔", "KPIs"],
   ["activity", "≋", "Activity"],
+  ["people", "◍", "People"],
 ];
 
 /* ---------- sheet ---------- */
@@ -78,6 +79,7 @@ async function selectRun(id) {
 
 async function loadDash() {
   state.dash = await api(`/api/runs/${state.runId}`);
+  state.people = null; // stakeholder rollup is per-run; refetch on demand
   if (!state.playbookWeek) state.playbookWeek = state.dash.current_week;
   render();
 }
@@ -95,7 +97,7 @@ function taskRow(t) {
   const n = (t.links || []).length;
   return `<div class="task${t.done ? " done" : ""}" data-task="${esc(t.id)}">
     <button class="check" data-toggle="${esc(t.id)}" aria-label="toggle task">${t.done ? "✓" : ""}</button>
-    <span class="task-title">${esc(t.title)}</span>
+    <span class="task-title">${esc(t.title)}${t.unread ? `<span class="unread-dot" title="Unread replies"></span>` : ""}</span>
     <button class="ev${n ? " has" : ""}" data-ev="${esc(t.id)}" aria-label="task feed" title="Feed">
       <span class="ev-ico">🔗</span>${n ? `<span class="ev-n">${n}</span>` : ""}
     </button>
@@ -125,7 +127,7 @@ function kpiGlance(k) {
 function render() {
   if (!state.dash) return;
   renderSideFoot();
-  ({ today: renderToday, playbook: renderPlaybook, kpis: renderKpis, activity: renderActivity })[state.tab]();
+  ({ today: renderToday, playbook: renderPlaybook, kpis: renderKpis, activity: renderActivity, people: renderPeople })[state.tab]();
   // wire toggles (event delegation once)
 }
 
@@ -158,10 +160,29 @@ function renderEmpty() {
 function renderToday() {
   const d = state.dash;
   const wk = d.weeks[d.current_week - 1];
+  // Stalled tasks: incomplete, feed quiet ≥3 days, current/past weeks only.
+  const stalled = [];
+  for (const w of d.weeks) {
+    if (w.week > d.current_week) continue;
+    for (const [role, ts] of Object.entries(w.roles))
+      for (const t of ts) if (t.stalled) stalled.push({ ...t, week: w.week, role });
+  }
+  stalled.sort((a, b) => (b.days_quiet || 0) - (a.days_quiet || 0));
   $("#view-today").innerHTML = `
     <h2>Today</h2>
     <p class="sub">Week ${wk.week} of ${d.weeks.length} · ${esc(wk.theme)} · ${wk.tasks_done}/${wk.tasks_total} tasks</p>
     <div class="bar" style="margin-bottom:16px"><i style="width:${wk.tasks_total ? Math.round(100 * wk.tasks_done / wk.tasks_total) : 0}%"></i></div>
+    ${stalled.length ? `
+    <h2 style="margin-top:4px">Needs attention</h2>
+    <p class="sub">Stalled — no feed activity in 3+ days</p>
+    <div class="card" style="padding:8px 16px;margin-bottom:16px">
+      ${stalled.map((t) => `
+        <div class="stall-row" data-ev="${esc(t.id)}">
+          <div style="flex:1;min-width:0"><b>${esc(t.title)}</b>
+            <div class="meta">W${t.week} · ${esc(t.role)}</div></div>
+          <span class="stall-days">${t.days_quiet}d quiet</span>
+        </div>`).join("")}
+    </div>` : ""}
     ${roleBlocks(wk.roles)}
     <h2 style="margin-top:24px">KPI glance</h2>
     <p class="sub">Week ${d.current_week} targets vs actuals</p>
@@ -237,7 +258,48 @@ function renderActivity() {
     <div class="card" style="padding:8px 16px">${items || `<div class="empty" style="padding:24px">Nothing yet.</div>`}</div>`;
 }
 
-/* ---------- sheets ---------- */
+/* ---------- people (stakeholder rollup) ---------- */
+async function renderPeople() {
+  const el = $("#view-people");
+  if (!state.people || state.peopleRun !== state.runId) {
+    el.innerHTML = `<h2>People</h2><p class="sub">Loading…</p>`;
+    try {
+      const r = await api(`/api/stakeholders?run_id=${encodeURIComponent(state.runId)}`);
+      state.people = r.stakeholders || [];
+      state.peopleRun = state.runId;
+    } catch (e) {
+      el.innerHTML = `<h2>People</h2><p class="sub">Couldn’t load stakeholders.</p><p class="meta">${esc(e.message)}</p>`;
+      return;
+    }
+  }
+  const list = state.people;
+  el.innerHTML = `<h2>People</h2>
+    <p class="sub">Stakeholders across this run’s threads — tap to expand</p>
+    ${list.length ? `<div class="card" style="padding:8px 16px">` + list.map((s, i) => `
+      <div class="person-row" data-person="${i}">
+        <div style="flex:1;min-width:0"><b>${esc(s.name)}</b>
+          <div class="meta">${esc(s.email)}</div></div>
+        <span class="meta">${s.threads.length} thread${s.threads.length === 1 ? "" : "s"} · ${s.tasks.length} task${s.tasks.length === 1 ? "" : "s"}</span>
+        ${s.threads.some((t) => t.unseen > 0) ? `<span class="unread-dot" title="Unread replies"></span>` : ""}
+      </div>
+      <div class="person-detail" id="person-${i}" hidden>
+        ${s.threads.map((t) => `
+          <div class="thread-row" data-ev="${esc(t.task_id)}" style="cursor:pointer">
+            <div class="thread-body"><b>${esc(t.subject)}</b>
+              <div class="meta">${esc(t.task_title)} · ${esc(t.last_date || "")}${t.unseen > 0 ? ` · <b style="color:var(--gold)">${t.unseen} new</b>` : ""}</div></div>
+          </div>`).join("") || `<div class="meta">No threads yet.</div>`}
+        ${s.tasks.length ? `<div class="meta" style="margin-top:6px">Tasks: ${s.tasks.map((t) =>
+          `<span class="taglike">${esc(t.title)} (W${t.week} · ${esc(t.role)})</span>`).join(" ")}</div>` : ""}
+      </div>`).join("") + `</div>`
+      : `<div class="card"><div class="empty" style="padding:24px">No stakeholders yet — link or send an email thread from a task’s feed.</div></div>`}`;
+  $$("#view-people [data-person]").forEach((r) => r.addEventListener("click", (e) => {
+    if (e.target.closest("[data-ev]")) return; // thread tap opens the feed sheet instead
+    const d = $(`#person-${r.dataset.person}`);
+    if (d) d.hidden = !d.hidden;
+  }));
+}
+
+// ---------- sheets ----------
 async function newRunSheet() {
   const pbs = await api("/api/playbooks").catch(() => []);
   const today = new Date().toISOString().slice(0, 10);
@@ -326,6 +388,13 @@ async function connSheet(id) {
     extra = `<div class="field"><label>New key label</label><input id="f-keylabel" placeholder="CRM nightly push"></div>
       <button class="btn ghost small" id="f-newkey" type="button">Generate key</button>
       <div id="f-keys" style="margin-top:8px">${rows || `<div class="meta">No keys yet.</div>`}</div>`;
+  } else if (id === "calendar-ical") {
+    extra = `
+      <div class="field"><label>iCal feed URL</label>
+        <input id="f-calurl" type="password" value="${esc(cfg.url || "")}" placeholder="https://…" autocomplete="off"></div>
+      <div class="field"><label>SUMMARY filter (optional)</label>
+        <input id="f-calquery" value="${esc(cfg.query || "")}" placeholder="e.g. discovery" autocomplete="off"></div>
+      <p class="meta" style="color:var(--muted);font-size:13px">Resolution order: connector config → <span class="mono">CALENDAR_ICAL_URL</span> env → gitignored <span class="mono">data/calendar.json</span>. The secret lives in the URL and is never logged. RRULE recurrence is not expanded in v1 — recurring events count once at their base instance.</p>`;
   } else {
     extra = `<p class="meta" style="color:var(--muted)">No configuration needed.</p>`;
   }
@@ -349,6 +418,9 @@ async function connSheet(id) {
       cfg.folder = $("#f-folder").value.trim();
       const gs = $("#f-goa-account");
       cfg.goa_account = gs ? gs.value : (cfg.goa_account || "");
+    } else if (id === "calendar-ical") {
+      cfg.url = $("#f-calurl").value.trim();
+      cfg.query = $("#f-calquery").value.trim();
     }
     connSheetSave(id, cfg);
   };
@@ -395,10 +467,14 @@ function findTask(taskId) {
 
 function metaLine(l) {
   const m = l.meta || {};
+  if (l.kind === "event" && m.starts_at) {
+    return `event · ${m.starts_at.slice(0, 16).replace("T", " ")}`;
+  }
   const bits = [l.kind];
   if (m.from) bits.push(m.from);
   if (m.date) bits.push(m.date);
   if (m.count) bits.push(m.count + (m.count === 1 ? " message" : " messages"));
+  if (m.unseen > 0) bits.push(`${m.unseen} new`);
   return bits.join(" · ");
 }
 
@@ -414,20 +490,40 @@ async function feedSheet(taskId) {
   const task = findTask(taskId);
   if (!task) return;
   const links = task.links || [];
+  const hasThreads = links.some((l) => l.source === "email-imap" && l.kind === "thread");
   openSheet(`
-    <h3>Feed</h3>
-    <p class="meta" style="color:var(--muted);font-size:13px;margin:-6px 0 12px">${esc(task.title)}</p>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h3 style="margin:0">Feed</h3>
+      ${hasThreads ? `<button class="btn ghost small" id="f-sync">Sync</button>` : ""}
+    </div>
+    <p class="meta" style="color:var(--muted);font-size:13px;margin:6px 0 12px">${esc(task.title)}</p>
     <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">Nothing in the feed yet.</div>`}</div>
     <h3 style="margin-top:20px">Add to feed</h3>
     <div class="pills" id="ev-src">
       <button class="pill active" data-evsrc="email">Email</button>
       <button class="pill" data-evsrc="assign">Assign</button>
+      <button class="pill" data-evsrc="meeting">Meeting</button>
       <button class="pill" data-evsrc="manual">Manual note</button>
       <button class="pill" data-evsrc="webhook">Webhook</button>
     </div>
     <div id="ev-form"></div>
     <div class="sheet-actions"><button class="btn ghost" id="f-cancel">Done</button></div>`);
   $("#f-cancel").onclick = closeSheet;
+  const syncBtn = $("#f-sync");
+  if (syncBtn) syncBtn.onclick = async () => {
+    syncBtn.disabled = true;
+    syncBtn.textContent = "Syncing…";
+    try {
+      const r = await api(`/api/runs/${state.runId}/tasks/${taskId}/sync-feed`, "POST");
+      await loadDash();
+      feedSheet(taskId);
+      if (r.new_replies > 0) { /* the refreshed sheet shows them */ }
+    } catch (e) {
+      alert(e.message);
+      syncBtn.disabled = false;
+      syncBtn.textContent = "Sync";
+    }
+  };
   $$("#ev-src [data-evsrc]").forEach((b) => b.addEventListener("click", () => {
     $$("#ev-src .pill").forEach((x) => x.classList.toggle("active", x === b));
     evForm(taskId, b.dataset.evsrc);
@@ -435,6 +531,10 @@ async function feedSheet(taskId) {
   evForm(taskId, "email");
   $$("#ev-list [data-unlink]").forEach((b) => b.addEventListener("click", () =>
     removeFromFeed(taskId, b.dataset.unlink)));
+  // Opening the feed marks its threads read (clears unread dots on next render).
+  api(`/api/runs/${state.runId}/tasks/${taskId}/feed/read`, "POST")
+    .then(() => loadDash())
+    .catch(() => { /* non-fatal */ });
 }
 
 async function removeFromFeed(taskId, linkId) {
@@ -517,6 +617,42 @@ function evForm(taskId, src) {
         btn.textContent = "Send";
       }
     };
+  } else if (src === "meeting") {
+    // Meeting — link a calendar event from the iCal feed into the feed.
+    const iso = (d) => d.toISOString().slice(0, 10);
+    const ago = new Date(Date.now() - 14 * 864e5), ahead = new Date(Date.now() + 14 * 864e5);
+    f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Link a calendar event as evidence. Configure the iCal feed under KPIs → Connectors → Calendar.</p>
+      <div class="field"><label>From</label><input id="f-mfrom" type="date" value="${iso(ago)}"></div>
+      <div class="field"><label>To</label><input id="f-mto" type="date" value="${iso(ahead)}"></div>
+      <div class="field"><label>Search (optional)</label>
+        <input id="f-mq" placeholder="e.g. discovery" autocomplete="off"></div>
+      <button class="btn" id="f-msearch">Search</button>
+      <div id="f-mresults" style="margin-top:12px"></div>`;
+    const go = async () => {
+      const box = $("#f-mresults");
+      box.innerHTML = `<div class="meta">Searching…</div>`;
+      try {
+        const r = await api(`/api/connectors/calendar-ical/events?from=${$("#f-mfrom").value}&to=${$("#f-mto").value}&q=${encodeURIComponent($("#f-mq").value.trim())}`);
+        if (!r.events.length) { box.innerHTML = `<div class="meta">No events found.</div>`; return; }
+        box.innerHTML = r.events.map((e) => `
+          <div class="thread-row">
+            <div class="thread-body"><b>${esc(e.summary)}</b>
+              <div class="meta">${esc(e.starts_at.slice(0, 16).replace("T", " "))}${e.recurring ? " · recurring" : ""}</div></div>
+            <button class="btn ghost small" data-link-event='${esc(JSON.stringify(e))}'>Add</button>
+          </div>`).join("");
+        $$("#f-mresults [data-link-event]").forEach((b) => b.addEventListener("click", async () => {
+          const ev = JSON.parse(b.dataset.linkEvent);
+          try {
+            await addToFeed(taskId, {
+              source: "calendar-ical", kind: "event", ref: ev.uid || ev.summary, label: ev.summary,
+              meta: { starts_at: ev.starts_at, ends_at: ev.ends_at },
+            });
+          } catch (e) { alert(e.message); }
+        }));
+      } catch (e) { box.innerHTML = `<div class="meta">${esc(e.message)}</div>`; }
+    };
+    $("#f-msearch").onclick = go;
+    $("#f-mq").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   } else {
     f.innerHTML = `<div class="field"><label>Search email threads</label>
       <input id="f-q" placeholder="e.g. Delivery Kickoff" autocomplete="off"></div>
