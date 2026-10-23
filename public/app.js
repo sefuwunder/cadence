@@ -599,9 +599,12 @@ function avatarHtml(addr, size) {
   size = size || 30;
   const { name, email } = addrParts(addr);
   if (!email || !email.includes("@")) return "";
+  const photo = `/api/contacts/photo?email=${encodeURIComponent(email.toLowerCase())}`;
   return `<span class="avatar" style="width:${size}px;height:${size}px;` +
     `font-size:${Math.round(size * 0.36)}px;background:${avColor(email)}" ` +
-    `title="${esc(name || email)}">${esc(avInitials(name, email))}</span>`;
+    `title="${esc(name || email)}">` +
+    `<img src="${photo}" alt="" loading="lazy" onerror="this.remove()">` +
+    `<span class="avatar-initials">${esc(avInitials(name, email))}</span></span>`;
 }
 /** Overlapping avatar stack for a thread link's participants (from/to). */
 function threadAvatars(l) {

@@ -116,7 +116,13 @@ select { max-width: 46vw; }
 .avatar {
   display: inline-flex; align-items: center; justify-content: center;
   border-radius: 50%; color: #14141b; font-weight: 700; flex: 0 0 auto;
+  position: relative; overflow: hidden;
 }
+.avatar img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: 50%;
+}
+.avatar-initials { position: relative; }
 .avatar-stack { display: inline-flex; align-items: center; flex: 0 0 auto; margin-right: 2px; }
 .avatar-stack .avatar { margin-left: -9px; border: 2px solid var(--ink-2); }
 .avatar-stack .avatar:first-child { margin-left: 0; }

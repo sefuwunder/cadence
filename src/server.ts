@@ -13,6 +13,7 @@ import { resolveSmtpConfig, sendWithConfig, type SmtpLineIO } from "./connectors
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
+import { getContactPhoto } from "./contacts.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -688,6 +689,22 @@ export function createApp(opts: {
         const contacts = db.query(
           "SELECT email, name, last_used FROM email_contacts ORDER BY last_used DESC LIMIT 20").all();
         return json({ contacts });
+      }
+      // Contact photo from the system address book (GOA-synced GNOME contacts).
+      // 404 → the UI falls back to the initial-based avatar. Cached in the
+      // browser for a day; the server cache (contact_photos) is 30 days.
+      if (path === "/api/contacts/photo" && m === "GET") {
+        const email = url.searchParams.get("email") || "";
+        const photo = await getContactPhoto(db, email);
+        if (!photo) return err(404, "no photo");
+        return new Response(photo.data as any, {
+          status: 200,
+          headers: {
+            "content-type": photo.mime,
+            "cache-control": "public, max-age=86400",
+            "content-length": String(photo.data.length),
+          },
+        });
       }
       // Calendar event search (Meeting pill in the task feed). Before the generic :id block.
       pm = path.match(/^\/api\/connectors\/calendar-ical\/events$/);

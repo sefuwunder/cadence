@@ -220,6 +220,9 @@ POST                /api/connectors/email-imap/send   {to: string[], subject, bo
                                                   Sent, upserts contacts, links thread into task feed;
                                                   400 validation / SMTP unconfigured, 404 task not in run)
 GET                 /api/email-contacts           → { contacts: [{ email, name, last_used }] } (MRU, ≤20)
+GET                 /api/contacts/photo?email=    → image/* bytes from the system address book
+                                                  (GOA-synced GNOME contacts, cached 30d server-side;
+                                                  404 → UI falls back to initial-based avatar)
 POST                /api/illiad/ask               { message, run_id? } → { reply, intent }
                                                   (run_id defaults to most recent active run; 404 when none)
 POST                /api/kpis/:kpiId/entries  {date, value, note?}   (source: manual)

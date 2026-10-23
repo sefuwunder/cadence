@@ -37,6 +37,10 @@ export function initDb(db: Database) {
     email TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
     last_used TEXT NOT NULL DEFAULT ''
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS contact_photos (
+    email TEXT PRIMARY KEY, mime TEXT NOT NULL DEFAULT 'image/jpeg',
+    data BLOB NOT NULL, fetched_at TEXT NOT NULL DEFAULT ''
+  )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_kpis_run ON kpis(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_entries_kpi ON metric_entries(kpi_id, date)`);

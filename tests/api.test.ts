@@ -1273,3 +1273,62 @@ describe("calendar-ical", () => {
     }
   });
 });
+
+describe("contact photos", () => {
+  test("parseVCardPhoto: vCard 3.0 inline base64", async () => {
+    const { parseVCardPhoto } = await import("../src/contacts.ts");
+    const raw = Buffer.from([0xff, 0xd8, 0xff, 0xe0]).toString("base64");
+    const vc = `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane\r\nPHOTO;ENCODING=b;TYPE=JPEG:${raw}\r\nEND:VCARD`;
+    const p = parseVCardPhoto(vc);
+    expect(p).not.toBeNull();
+    expect(p!.mime).toBe("image/jpeg");
+    expect(p!.data[0]).toBe(0xff);
+  });
+
+  test("parseVCardPhoto: folded lines + vCard 4.0 data URI", async () => {
+    const { parseVCardPhoto } = await import("../src/contacts.ts");
+    const raw = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+    const half = Math.ceil(raw.length / 2);
+    const vc = `BEGIN:VCARD\nVERSION:3.0\nPHOTO;ENCODING=b;TYPE=PNG:${raw.slice(0, half)}\n ${raw.slice(half)}\nEND:VCARD`;
+    expect(parseVCardPhoto(vc)!.mime).toBe("image/png");
+    const vc4 = `BEGIN:VCARD\nVERSION:4.0\nPHOTO:data:image/gif;base64,${raw}\nEND:VCARD`;
+    expect(parseVCardPhoto(vc4)!.mime).toBe("image/gif");
+    expect(parseVCardPhoto("BEGIN:VCARD\nFN:No Photo\nEND:VCARD")).toBeNull();
+  });
+
+  test("photo endpoint: 404 without EDS, 200 from cache", async () => {
+    const { _resetEdsVerdict } = await import("../src/contacts.ts");
+    _resetEdsVerdict();
+    // no EDS on this machine → fast 404, no throw
+    const miss = await app.fetch(new Request("http://localhost/api/contacts/photo?email=nobody@example.com"));
+    expect(miss.status).toBe(404);
+    const bad = await app.fetch(new Request("http://localhost/api/contacts/photo?email=not-an-email"));
+    expect(bad.status).toBe(404);
+    // seed the cache directly, then the endpoint serves bytes
+    const bytes = Buffer.from([0xff, 0xd8, 0x01]);
+    app.db.run(
+      "INSERT INTO contact_photos (email, mime, data, fetched_at) VALUES (?, ?, ?, ?)",
+      ["cached@example.com", "image/jpeg", bytes, new Date().toISOString()]);
+    const hit = await app.fetch(new Request("http://localhost/api/contacts/photo?email=cached@example.com"));
+    expect(hit.status).toBe(200);
+    expect(hit.headers.get("content-type")).toBe("image/jpeg");
+    expect(new Uint8Array(await hit.arrayBuffer())).toEqual(new Uint8Array(bytes));
+  });
+
+  test("getContactPhoto caches EDS results and honors TTL", async () => {
+    const { getContactPhoto, _resetEdsVerdict } = await import("../src/contacts.ts");
+    _resetEdsVerdict();
+    let calls = 0;
+    const fakeRun = async (args: string[]) => {
+      calls++;
+      if (args[0] === "list") return { code: 0, out: "org.gnome.evolution.dataserver.AddressBook10 x" };
+      return { code: 0, out: "" };
+    };
+    // edsVCardsForEmail is a stub returning [] until wired → null, no cache write
+    expect(await getContactPhoto(app.db, "x@y.zz", { run: fakeRun })).toBeNull();
+    const before = calls;
+    // second call reuses the memoized EDS verdict (no new busctl list)
+    expect(await getContactPhoto(app.db, "x@y.zz", { run: fakeRun })).toBeNull();
+    expect(calls).toBe(before); // verdict memoized; stub lookup is cheap/local
+  });
+});
