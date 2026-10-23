@@ -1559,3 +1559,75 @@ describe("contact photo bulk sync", () => {
 });
 
 });
+describe("manual contact photos", () => {
+  const jpegB64 = "/9j/4AAQSkZJRg=="; // FF D8 FF E0 — minimal JPEG magic
+  const pngB64 = "iVBORw0KGgo=";     // 89 50 4E 47 — minimal PNG magic
+
+  test("parseManualPhoto: data URI + raw base64, rejects garbage", async () => {
+    const m = await import("../src/contacts.ts");
+    const j = m.parseManualPhoto(`data:image/jpeg;base64,${jpegB64}`);
+    expect(j.mime).toBe("image/jpeg");
+    expect(m.parseManualPhoto(pngB64).mime).toBe("image/png");
+    expect(() => m.parseManualPhoto("")).toThrow(/no image data/);
+    expect(() => m.parseManualPhoto("aGVsbG8=")).toThrow(/not a recognized image/); // "hello"
+    expect(() => m.parseManualPhoto("!!!not-base64!!!")).toThrow();
+    const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0);
+    big[0] = 0xff; big[1] = 0xd8;
+    expect(() => m.parseManualPhoto(big.toString("base64"))).toThrow(/too large/);
+  });
+
+  test("POST saves a manual photo; GET serves it; manual survives EDS sync", async () => {
+    const m = await import("../src/contacts.ts");
+    const r = await call("POST", "/api/contacts/photo",
+      { email: "manual@acme.com", data: `data:image/jpeg;base64,${jpegB64}` });
+    expect(r.status).toBe(200);
+    expect(r.data.source).toBe("manual");
+    const row: any = app.db.query("SELECT source FROM contact_photos WHERE email = ?").get("manual@acme.com");
+    expect(row.source).toBe("manual");
+    const hit = await app.fetch(new Request("http://localhost/api/contacts/photo?email=manual@acme.com"));
+    expect(hit.status).toBe(200);
+    expect(hit.headers.get("content-type")).toBe("image/jpeg");
+
+    // EDS bulk sync must not clobber the manual photo.
+    const fakeBin = "/tmp/fake-ab-export2.sh";
+    await Bun.write(fakeBin,
+      `#!/bin/sh\nprintf 'BEGIN:VCARD\\nFN:Manual\\nEMAIL:manual@acme.com\\nPHOTO;ENCODING=b;TYPE=JPEG:${jpegB64}\\nEND:VCARD\\n'; exit 0\n`);
+    const { chmodSync, mkdirSync, writeFileSync, rmSync } = await import("fs");
+    chmodSync(fakeBin, 0o755);
+    const dir = "/tmp/fake-eds-sources2";
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/u1.source`, "Enabled=true\nContactsEnabled=true\n");
+    const origBin = process.env.CADENCE_ADDRESSBOOK_EXPORT;
+    process.env.CADENCE_ADDRESSBOOK_EXPORT = fakeBin;
+    try {
+      const res = await m.syncPhotosFromEDS(app.db, { sourcesDir: dir });
+      expect(res.photos).toBe(1);
+      const kept: any = app.db.query("SELECT source, data FROM contact_photos WHERE email = ?").get("manual@acme.com");
+      expect(kept.source).toBe("manual"); // still manual, not overwritten by the sync
+      rmSync(dir, { recursive: true, force: true });
+    } finally {
+      if (origBin === undefined) delete process.env.CADENCE_ADDRESSBOOK_EXPORT;
+      else process.env.CADENCE_ADDRESSBOOK_EXPORT = origBin;
+    }
+    // Manual photos never expire: backdate fetched_at, still served.
+    app.db.run("UPDATE contact_photos SET fetched_at = '2000-01-01T00:00:00.000Z' WHERE email = 'manual@acme.com'");
+    const hit2 = await app.fetch(new Request("http://localhost/api/contacts/photo?email=manual@acme.com"));
+    expect(hit2.status).toBe(200);
+  });
+
+  test("POST validates; DELETE removes", async () => {
+    let r = await call("POST", "/api/contacts/photo", { email: "bad", data: jpegB64 });
+    expect(r.status).toBe(400);
+    r = await call("POST", "/api/contacts/photo", { email: "x@acme.com", data: "aGVsbG8=" });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/not a recognized image/);
+    r = await call("DELETE", "/api/contacts/photo?email=manual@acme.com");
+    expect(r.status).toBe(200);
+    const gone = await app.fetch(new Request("http://localhost/api/contacts/photo?email=manual@acme.com"));
+    expect(gone.status).toBe(404);
+    expect(gone.headers.get("cache-control")).toBe("no-store");
+    // idempotent
+    r = await call("DELETE", "/api/contacts/photo?email=manual@acme.com");
+    expect(r.status).toBe(200);
+  });
+});

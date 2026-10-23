@@ -33,6 +33,10 @@ Hit **+** in the top bar to start a run from it.
 - **Activity** — feed: task completions + metric entries with source badges.
 - **People** — stakeholder rollup: every counterparty across the run's email
   threads, expandable to their threads (tap to open that task's feed) and tasks.
+  Avatars prefer the contact's real photo (synced from the system address book;
+  see CONTACTS.md). **Manual avatars**: hover any avatar to upload a photo
+  (JPEG/PNG/GIF/WebP, ≤2 MB) — manual photos win over synced ones and never
+  expire; "Remove photo" in the expanded detail.
 
 ## Task feed
 

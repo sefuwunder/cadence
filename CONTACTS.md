@@ -18,7 +18,15 @@ and fall back to initial-based avatars when none is found.
   with `CADENCE_EDS_SOURCES` (tests).
 - **Serving**: `GET /api/contacts/photo?email=` reads the cache only —
   fast, no D-Bus per avatar. 404 → the UI falls back to initials.
-  Browser-cached 24h; server cache 30 days.
+  404s are `no-store` (a freshly uploaded photo shows immediately);
+  hits browser-cached 24h; server cache 30 days.
+- **Manual avatars**: `POST /api/contacts/photo` `{email, data}` where data
+  is a `data:image/…;base64,…` URI or raw base64 (JPEG/PNG/GIF/WebP, ≤2 MB,
+  magic-byte verified). Stored with `source='manual'` in `contact_photos`:
+  manual photos win — the bulk sync's upsert skips them — and never expire.
+  `DELETE /api/contacts/photo?email=` removes a stored avatar. People-tab UI:
+  hover an avatar → ✎ → file picker → upload; "Remove photo" in the expanded
+  person detail.
 - **Frontend**: avatars render `<img src="…" loading="lazy"
   onerror="this.remove()">` layered over the initials — a 404 reveals the
   initials with zero JS.

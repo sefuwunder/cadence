@@ -305,10 +305,11 @@ async function renderPeople() {
   }
   const list = state.people;
   el.innerHTML = `<h2>People</h2>
-    <p class="sub">Stakeholders across this run’s threads — tap to expand</p>
+    <p class="sub">Stakeholders across this run’s threads — tap to expand, hover an avatar to change its photo</p>
+    <input type="file" id="avatar-file" accept="image/*" hidden>
     ${list.length ? `<div class="card" style="padding:8px 16px">` + list.map((s, i) => `
       <div class="person-row" data-person="${i}">
-        ${avatarHtml(s.name ? `${s.name} <${s.email}>` : s.email, 34)}
+        <span class="avatar-edit" data-avatar-email="${esc(s.email)}" title="Change photo">${avatarHtml(s.name ? `${s.name} <${s.email}>` : s.email, 34)}<span class="avatar-pencil">✎</span></span>
         <div style="flex:1;min-width:0"><b>${esc(s.name)}</b>
           <div class="meta">${esc(s.email)}</div></div>
         <span class="meta">${s.threads.length} thread${s.threads.length === 1 ? "" : "s"} · ${s.tasks.length} task${s.tasks.length === 1 ? "" : "s"}</span>
@@ -322,12 +323,44 @@ async function renderPeople() {
           </div>`).join("") || `<div class="meta">No threads yet.</div>`}
         ${s.tasks.length ? `<div class="meta" style="margin-top:6px">Tasks: ${s.tasks.map((t) =>
           `<span class="taglike">${esc(t.title)} (W${t.week} · ${esc(t.role)})</span>`).join(" ")}</div>` : ""}
+        <div style="margin-top:8px"><button class="btn ghost small" data-photo-remove="${esc(s.email)}" type="button">Remove photo</button></div>
       </div>`).join("") + `</div>`
       : `<div class="card"><div class="empty" style="padding:24px">No stakeholders yet — link or send an email thread from a task’s feed.</div></div>`}`;
   $$("#view-people [data-person]").forEach((r) => r.addEventListener("click", (e) => {
-    if (e.target.closest("[data-ev]")) return; // thread tap opens the feed sheet instead
+    if (e.target.closest("[data-ev]") || e.target.closest("[data-avatar-email]")) return;
     const d = $(`#person-${r.dataset.person}`);
     if (d) d.hidden = !d.hidden;
+  }));
+  $$("#view-people [data-avatar-email]").forEach((a) => a.addEventListener("click", (e) => {
+    e.stopPropagation(); // don't toggle the person detail
+    const inp = $("#avatar-file");
+    if (inp) { inp.dataset.email = a.dataset.avatarEmail; inp.click(); }
+  }));
+  const fi = $("#avatar-file");
+  if (fi) fi.onchange = () => {
+    const f = fi.files && fi.files[0];
+    const em = fi.dataset.email;
+    fi.value = "";
+    if (!f || !em) return;
+    if (f.size > 2 * 1024 * 1024) { alert("That image is too large — 2 MB max."); return; }
+    const rd = new FileReader();
+    rd.onload = async () => {
+      try {
+        await api("/api/contacts/photo", "POST", { email: em, data: rd.result });
+        state.peopleRun = null; // refetch: the new photo isn't in any cache yet (404s are no-store)
+        renderPeople();
+      } catch (err) { alert(err.message); }
+    };
+    rd.onerror = () => alert("Couldn't read that file.");
+    rd.readAsDataURL(f);
+  };
+  $$("#view-people [data-photo-remove]").forEach((b) => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      await api(`/api/contacts/photo?email=${encodeURIComponent(b.dataset.photoRemove)}`, "DELETE");
+      state.peopleRun = null;
+      renderPeople();
+    } catch (err) { alert(err.message); }
   }));
 }
 

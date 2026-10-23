@@ -254,8 +254,9 @@ export async function syncPhotosFromEDS(
   }
   const now = new Date().toISOString();
   const up = db.prepare(
-    "INSERT INTO contact_photos (email, mime, data, fetched_at) VALUES (?, ?, ?, ?) " +
-    "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, fetched_at = excluded.fetched_at");
+    "INSERT INTO contact_photos (email, mime, data, fetched_at, source) VALUES (?, ?, ?, ?, 'eds') " +
+    "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, " +
+    "fetched_at = excluded.fetched_at WHERE contact_photos.source <> 'manual'");
   for (const uid of uids) {
     const r = await spawnCapture(
       [bin, "--format=vcard", uid], opts.timeoutMs || 60000);
@@ -307,24 +308,87 @@ export async function getContactPhoto(
   if (!validEmail(em)) return null;
   try {
     const row: any = db.query(
-      "SELECT mime, data, fetched_at FROM contact_photos WHERE email = ?").get(em);
+      "SELECT mime, data, fetched_at, source FROM contact_photos WHERE email = ?").get(em);
     if (row) {
-      const age = Date.now() - new Date(row.fetched_at).getTime();
-      if (Number.isFinite(age) && age < PHOTO_TTL_MS && row.data?.length) {
+      // Manual uploads never expire and are never overwritten by the sync.
+      const fresh = row.source === "manual" ||
+        (Number.isFinite(Date.now() - new Date(row.fetched_at).getTime()) &&
+         Date.now() - new Date(row.fetched_at).getTime() < PHOTO_TTL_MS);
+      if (fresh && row.data?.length) {
         return { mime: row.mime || "image/jpeg", data: row.data };
       }
     }
     const photo = await edsPhotoByEmail(em, opts.run);
     if (photo) {
       db.run(
-        "INSERT INTO contact_photos (email, mime, data, fetched_at) VALUES (?, ?, ?, ?) " +
-        "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, fetched_at = excluded.fetched_at",
+        "INSERT INTO contact_photos (email, mime, data, fetched_at, source) VALUES (?, ?, ?, ?, 'eds') " +
+        "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, " +
+        "fetched_at = excluded.fetched_at WHERE contact_photos.source <> 'manual'",
         [em, photo.mime, Buffer.from(photo.data), new Date().toISOString()]);
     }
     return photo;
   } catch {
     return null;
   }
+}
+
+/** Magic-byte sniffing for the image formats browsers can render as avatars. */
+function sniffImageMime(buf: Buffer): string | null {
+  if (buf.length > 2 && buf[0] === 0xff && buf[1] === 0xd8) return "image/jpeg";
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.length > 6 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return "image/gif";
+  if (buf.length > 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  return null;
+}
+
+export const MANUAL_PHOTO_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Parse a user-supplied avatar: a `data:image/…;base64,…` URI or raw base64.
+ *  Returns { mime, data } or throws a human-readable error. */
+export function parseManualPhoto(input: string): PhotoResult {
+  const s = String(input || "").trim();
+  if (!s) throw new Error("no image data provided");
+  let b64 = s;
+  const dm = s.match(/^data:(image\/[a-z+]+);base64,(.+)$/is);
+  if (dm) b64 = dm[2];
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(b64.replace(/\s+/g, ""), "base64");
+  } catch {
+    throw new Error("could not decode the image (expected base64)");
+  }
+  if (!buf.length) throw new Error("could not decode the image (expected base64)");
+  // Reject base64 that decodes to garbage: re-encoding must round-trip.
+  if (Buffer.from(buf.toString("base64"), "base64").length !== buf.length) {
+    throw new Error("could not decode the image (expected base64)");
+  }
+  if (buf.length > MANUAL_PHOTO_MAX_BYTES) {
+    throw new Error(`image is too large (${(buf.length / 1048576).toFixed(1)} MB — max 2 MB)`);
+  }
+  const mime = sniffImageMime(buf);
+  if (!mime) throw new Error("not a recognized image (JPEG, PNG, GIF, or WebP)");
+  return { mime, data: new Uint8Array(buf) };
+}
+
+/** Store a user-uploaded avatar. Manual photos win over EDS-synced ones and
+ *  never expire. Throws human-readable errors. */
+export function saveManualPhoto(db: any, email: string, input: string): { email: string; mime: string } {
+  const em = String(email || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) throw new Error("a valid email is required");
+  const photo = parseManualPhoto(input);
+  db.run(
+    "INSERT INTO contact_photos (email, mime, data, fetched_at, source) VALUES (?, ?, ?, ?, 'manual') " +
+    "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, " +
+    "fetched_at = excluded.fetched_at, source = 'manual'",
+    [em, photo.mime, Buffer.from(photo.data), new Date().toISOString()]);
+  return { email: em, mime: photo.mime };
+}
+
+/** Remove a stored avatar (manual or synced). Idempotent. */
+export function deleteContactPhoto(db: any, email: string): void {
+  const em = String(email || "").trim().toLowerCase();
+  if (!em) return;
+  db.run("DELETE FROM contact_photos WHERE email = ?", [em]);
 }
 
 /** Test hook: reset the memoized EDS availability verdict. */

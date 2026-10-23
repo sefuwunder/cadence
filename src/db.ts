@@ -41,6 +41,12 @@ export function initDb(db: Database) {
     email TEXT PRIMARY KEY, mime TEXT NOT NULL DEFAULT 'image/jpeg',
     data BLOB NOT NULL, fetched_at TEXT NOT NULL DEFAULT ''
   )`);
+  // 'eds' = synced from the system address book, 'manual' = user-uploaded
+  // (manual wins: the bulk sync never overwrites it, and it never expires).
+  const photoCols = db.query("PRAGMA table_info(contact_photos)").all().map((c: any) => c.name);
+  if (!photoCols.includes("source")) {
+    db.run(`ALTER TABLE contact_photos ADD COLUMN source TEXT NOT NULL DEFAULT 'eds'`);
+  }
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_kpis_run ON kpis(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_entries_kpi ON metric_entries(kpi_id, date)`);

@@ -128,6 +128,19 @@ select { max-width: 46vw; }
 .avatar-stack .avatar:first-child { margin-left: 0; }
 .avatar-more { background: var(--ink-3) !important; color: var(--muted) !important; }
 
+/* manual avatar editing (People tab) */
+.avatar-edit { position: relative; display: inline-block; cursor: pointer; flex: 0 0 auto; }
+.avatar-pencil {
+  position: absolute; right: -3px; bottom: -3px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--ink-3); color: var(--gold);
+  font-size: 11px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line);
+  opacity: 0; transition: opacity .15s; pointer-events: none;
+}
+.avatar-edit:hover .avatar-pencil { opacity: 1; }
+
 /* sending accounts (connector setup) */
 .acct-row {
   display: flex; align-items: center; gap: 10px;

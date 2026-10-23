@@ -13,7 +13,7 @@ import { sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
-import { getContactPhoto, syncPhotosFromEDS } from "./contacts.ts";
+import { getContactPhoto, syncPhotosFromEDS, saveManualPhoto, deleteContactPhoto } from "./contacts.ts";
 import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig, ownEmails } from "./mail-accounts.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
@@ -781,11 +781,18 @@ export function createApp(opts: {
       }
       if (path === "/api/contacts/photo" && m === "GET") {
         // Single photo from the cache (populated by the bulk sync above).
-        // 404 → the UI falls back to the initial-based avatar. The browser
-        // caches hits for a day; the server cache is 30 days.
+        // 404 → the UI falls back to the initial-based avatar. 404s are
+        // explicitly no-store so a freshly uploaded photo shows immediately.
+        // The browser caches hits for a day; the server cache is 30 days
+        // (manual uploads never expire).
         const email = url.searchParams.get("email") || "";
         const photo = await getContactPhoto(db, email);
-        if (!photo) return err(404, "no photo");
+        if (!photo) {
+          return new Response(JSON.stringify({ error: "no photo" }), {
+            status: 404,
+            headers: { "content-type": "application/json", "cache-control": "no-store" },
+          });
+        }
         return new Response(photo.data as any, {
           status: 200,
           headers: {
@@ -794,6 +801,23 @@ export function createApp(opts: {
             "content-length": String(photo.data.length),
           },
         });
+      }
+      // Manually set a contact's avatar. Accepts a data: URI or raw base64
+      // (JPEG/PNG/GIF/WebP, ≤2 MB). Manual photos win over EDS-synced ones
+      // and never expire.
+      if (path === "/api/contacts/photo" && m === "POST") {
+        const b = await body(req);
+        try {
+          const saved = saveManualPhoto(db, b?.email, b?.data);
+          return json({ ...saved, source: "manual" });
+        } catch (e: any) {
+          return err(400, e?.message || "could not save the photo");
+        }
+      }
+      // Remove a stored avatar (manual or synced). Idempotent.
+      if (path === "/api/contacts/photo" && m === "DELETE") {
+        deleteContactPhoto(db, url.searchParams.get("email") || "");
+        return json({ ok: true });
       }
       // Calendar event search (Meeting pill in the task feed). Before the generic :id block.
       pm = path.match(/^\/api\/connectors\/calendar-ical\/events$/);
