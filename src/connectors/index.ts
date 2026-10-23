@@ -34,7 +34,9 @@ const dir = dirname(fileURLToPath(import.meta.url));
 async function load(): Promise<Map<string, Connector>> {
   const reg = new Map<string, Connector>();
   for (const f of readdirSync(dir).sort()) {
-    if (f === "index.ts" || !f.endsWith(".ts")) continue;
+    // email-smtp.ts is a sender library for "Assign from feed", not a sync
+    // connector — it exports no `connector` and must not warn on load.
+    if (f === "index.ts" || f === "email-smtp.ts" || !f.endsWith(".ts")) continue;
     const mod = await import(join(dir, f));
     const c = mod?.connector as Connector | undefined;
     if (!c || !c.id || typeof c.sync !== "function") {

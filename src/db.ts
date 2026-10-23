@@ -33,10 +33,15 @@ export function initDb(db: Database) {
   db.run(`CREATE TABLE IF NOT EXISTS connector_cfg (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}'
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS email_contacts (
+    email TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+    last_used TEXT NOT NULL DEFAULT ''
+  )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_kpis_run ON kpis(run_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_entries_kpi ON metric_entries(kpi_id, date)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_links_task ON task_links(task_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_contacts_used ON email_contacts(last_used DESC)`);
 }
 
 /** Seed the template playbook on a fresh database. Idempotent. */

@@ -8,7 +8,8 @@ import { readFileSync, existsSync, mkdirSync } from "fs";
 import { initDb, seedIfEmpty } from "./db.ts";
 import { getConnector, connectors } from "./connectors/index.ts";
 import { keyIsValid } from "./connectors/webhook.ts";
-import { searchThreads } from "./connectors/email-imap.ts";
+import { searchThreads, appendToSent, normalizeSubject } from "./connectors/email-imap.ts";
+import { resolveSmtpConfig, sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
@@ -164,7 +165,7 @@ function getDashboard(db: Database, runId: string): any | null {
 }
 
 // ---------- app ----------
-export function createApp(opts: { dbPath: string }) {
+export function createApp(opts: { dbPath: string; smtpIoFactory?: () => Promise<SmtpLineIO> }) {
   const db = new Database(opts.dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   initDb(db);
@@ -362,6 +363,65 @@ export function createApp(opts: { dbPath: string }) {
           const msg = e?.message || "thread search failed";
           return err(/missing IMAP credentials/.test(msg) ? 400 : 502, msg);
         }
+      }
+      // Assign from feed: compose + send an email thread, then link it to the
+      // task's feed. Always user-initiated from the UI — never auto-sent.
+      pm = path.match(/^\/api\/connectors\/email-imap\/send$/);
+      if (pm && m === "POST") {
+        const b = await body(req);
+        const toRaw = Array.isArray(b?.to) ? b.to : (typeof b?.to === "string" ? [b.to] : []);
+        const to = [...new Set(toRaw.map((t: any) => String(t).trim().toLowerCase()).filter(Boolean))];
+        if (!to.length) return err(400, "to (at least one recipient) is required");
+        const bad = to.find((t) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t));
+        if (bad) return err(400, `invalid email address: ${bad}`);
+        const subject = String(b?.subject || "").trim();
+        if (!subject) return err(400, "subject is required");
+        const msgBody = String(b?.body || "").trim();
+        if (!msgBody) return err(400, "body is required");
+        const t: any = db.query("SELECT id FROM tasks WHERE id = ? AND run_id = ?")
+          .get(b?.task_id, b?.run_id);
+        if (!t) return err(404, "task not found");
+        const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
+        const config = row ? JSON.parse(row.config_json) : {};
+        let cfg;
+        try {
+          cfg = await resolveSmtpConfig(config);
+        } catch (e: any) {
+          return err(400, e?.message || "SMTP is not configured");
+        }
+        let sent;
+        try {
+          sent = await sendWithConfig(cfg, { to, subject, body: msgBody }, opts.smtpIoFactory);
+        } catch (e: any) {
+          return err(502, e?.message || "send failed");
+        }
+        // File the sent message in Sent (best effort — the mail is already out).
+        try {
+          await appendToSent({ config, raw: sent.raw });
+        } catch (e: any) {
+          console.error("[cadence] sent-mail APPEND failed:", e?.message || e);
+        }
+        // Remember the contacts, most-recently-used first.
+        const now = new Date().toISOString();
+        const up = db.prepare(
+          "INSERT INTO email_contacts (email, name, last_used) VALUES (?, '', ?) " +
+          "ON CONFLICT(email) DO UPDATE SET last_used = excluded.last_used");
+        db.transaction(() => { for (const e of to) up.run(e, now); })();
+        // Link the new thread into the task's feed (newest first by created_at).
+        const linkId = uuid();
+        db.run(
+          "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) " +
+          "VALUES (?, ?, 'email-imap', 'thread', ?, ?, ?, ?)",
+          [linkId, b.task_id, normalizeSubject(subject), subject.slice(0, 500),
+           JSON.stringify({ from: sent.from, to, date: now.slice(0, 10), count: 1,
+                            message_id: sent.messageId }), now]);
+        return json({ link_id: linkId, message_id: sent.messageId }, 201);
+      }
+      // Recent email contacts for the Assign-from-feed datalist.
+      if (path === "/api/email-contacts" && m === "GET") {
+        const contacts = db.query(
+          "SELECT email, name, last_used FROM email_contacts ORDER BY last_used DESC LIMIT 20").all();
+        return json({ contacts });
       }
       pm = path.match(/^\/api\/connectors\/([^/]+)$/);
       if (pm && (m === "GET" || m === "POST")) {

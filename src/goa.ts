@@ -9,11 +9,12 @@
 //   org.gnome.OnlineAccounts.Account: Id, ProviderType, ProviderName,
 //     MailEnabled / MailDisabled, PresentationIdentity
 //   org.gnome.OnlineAccounts.Mail: EmailAddress, ImapHost/UserName,
-//     ImapUseSsl/Tls
+//     ImapUseSsl/Tls, SmtpHost/UserName, SmtpUseSsl/Tls/Auth, SmtpAuthXoauth2
 //   org.gnome.OnlineAccounts.Account.EnsureCredentials() first, per the GOA
 //     docs — this refreshes expired credentials from the keyring
 //   org.gnome.OnlineAccounts.OAuth2Based.GetAccessToken() → fresh token
-//   org.gnome.OnlineAccounts.PasswordBased.GetPassword("imap-password")
+//   org.gnome.OnlineAccounts.PasswordBased.GetPassword("imap-password" |
+//     "smtp-password") — these are the ids GOA's own backends store under
 //
 // Tokens/passwords are fetched on demand and never written to Cadence's DB.
 
@@ -39,6 +40,12 @@ export interface GoaMailAccount {
   imapUser: string;
   imapSsl: boolean;
   imapTls: boolean;
+  smtpHost: string;
+  smtpUser: string;
+  smtpSsl: boolean;
+  smtpTls: boolean;
+  smtpAuth: boolean;
+  smtpXoauth2: boolean;
   oauth2: boolean;
   passwordBased: boolean;
 }
@@ -51,6 +58,8 @@ export interface GoaCredentials {
   token?: string;
   /** Plain IMAP password (passwordBased only). */
   imapPassword?: string;
+  /** Plain SMTP password (passwordBased only). */
+  smtpPassword?: string;
 }
 
 export type RunFn = (cmd: string, args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
@@ -186,6 +195,12 @@ function toAccount(objectPath: string, ifaces: Record<string, Record<string, any
     imapUser: str(mail["ImapUserName"]) || email,
     imapSsl: bool(mail["ImapUseSsl"]),
     imapTls: bool(mail["ImapUseTls"]),
+    smtpHost: str(mail["SmtpHost"]),
+    smtpUser: str(mail["SmtpUserName"]) || email,
+    smtpSsl: bool(mail["SmtpUseSsl"]),
+    smtpTls: bool(mail["SmtpUseTls"]),
+    smtpAuth: bool(mail["SmtpUseAuth"]),
+    smtpXoauth2: bool(mail["SmtpAuthXoauth2"]),
     oauth2: "org.gnome.OnlineAccounts.OAuth2Based" in ifaces,
     passwordBased: "org.gnome.OnlineAccounts.PasswordBased" in ifaces,
   };
@@ -278,19 +293,29 @@ export async function getGoaCredentials(acct: GoaMailAccount, run: RunFn = defau
   }
   if (acct.passwordBased) {
     const [imapPassword] = await busCall(run, GOA_BUS, acct.objectPath, "org.gnome.OnlineAccounts.PasswordBased", "GetPassword", "s", "imap-password");
+    const [smtpPassword] = await busCall(run, GOA_BUS, acct.objectPath, "org.gnome.OnlineAccounts.PasswordBased", "GetPassword", "s", "smtp-password");
     if (!imapPassword) throw new GoaError("auth", `GOA account ${acct.email}: no stored IMAP password`);
-    return { user: acct.email, oauth2: false, imapPassword: String(imapPassword) };
+    return { user: acct.email, oauth2: false, imapPassword: String(imapPassword), smtpPassword: String(smtpPassword || "") };
   }
   throw new GoaError("auth", `GOA account ${acct.email}: neither OAuth2 nor password credentials available`);
 }
 
-// ---------- pure config mapper (no I/O; unit-tested) ----------
+// ---------- pure config mappers (no I/O; unit-tested) ----------
 
 export interface GoaImapCfg { host: string; port: number; user: string; secure: boolean }
+export interface GoaSmtpCfg { host: string; port: number; user: string; secure: "ssl" | "starttls" }
 
 /** IMAP connection for a GOA account. SSL accounts connect on 993. */
 export function goaImapCfg(acct: GoaMailAccount): GoaImapCfg {
   if (!acct.imapHost) throw new GoaError("no-account", `GOA account ${acct.email} has no IMAP host`);
   if (!acct.imapSsl) throw new GoaError("no-account", `GOA account ${acct.email} needs IMAP STARTTLS, which Cadence doesn't support yet`);
   return { host: acct.imapHost, port: 993, user: acct.imapUser, secure: true };
+}
+
+/** SMTP connection for a GOA account. SSL → 465, STARTTLS → 587. Refuses unencrypted. */
+export function goaSmtpCfg(acct: GoaMailAccount): GoaSmtpCfg {
+  if (!acct.smtpHost) throw new GoaError("no-account", `GOA account ${acct.email} has no SMTP host`);
+  if (acct.smtpSsl) return { host: acct.smtpHost, port: 465, user: acct.smtpUser, secure: "ssl" };
+  if (acct.smtpTls) return { host: acct.smtpHost, port: 587, user: acct.smtpUser, secure: "starttls" };
+  throw new GoaError("no-account", `GOA account ${acct.email} needs unencrypted SMTP, which Cadence won't do`);
 }

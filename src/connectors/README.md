@@ -59,12 +59,28 @@ GOA credentials are fetched on demand per sync/thread search and never
 persisted — only the selected account id is stored. `goaAvailable()` /
 `listGoaMailAccounts()` never throw on an absent GOA; they report it.
 
+**Sending (Assign from feed).** `src/connectors/email-smtp.ts` is a sender
+library (not a sync connector — `index.ts` skips it): EHLO → STARTTLS (587) or
+implicit TLS (465) → AUTH LOGIN / AUTH XOAUTH2 → MAIL FROM / RCPT TO / DATA →
+QUIT, over an injectable `SmtpLineIO` (mock it in tests). Config resolution
+mirrors IMAP: connector config → `CADENCE_SMTP_*` env
+(`CADENCE_SMTP_HOST/PORT/USER/PASS/SECURE`, SECURE is `ssl`|`starttls`) →
+`data/imap.json` `smtp_*` keys → GOA SMTP of the *same* selected account
+(OAuth2 → XOAUTH2, password → AUTH LOGIN with the stored SMTP password,
+falling back to the IMAP one). After a successful send the message is
+APPENDed to the auto-detected Sent folder (see `appendToSent` in
+email-imap.ts) so it appears in sent-mail and in later thread searches, the
+recipients are upserted into `email_contacts` (most-recently-used first), and
+a `task_links` row (`source: email-imap, kind: thread`, ref = normalized
+subject) is created. Sending is always user-initiated from the task feed —
+the Send button is the confirmation; nothing auto-sends anywhere.
+
 ## The three built-ins
 
 | id | mode | notes |
 |----|------|-------|
 | `manual` | no-op | Metrics entered by hand; `sync()` returns `[]`. |
-| `email-imap` | poll + thread search | Counts Sent-folder messages per day; also powers email-thread feed linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, `data/imap.json` (gitignored), or GNOME Online Accounts (`goa_account` selection; OAuth2 → XOAUTH2, creds never stored). Read-only. |
+| `email-imap` | poll + thread search + **send** | Counts Sent-folder messages per day; also powers email-thread feed linking (`GET /api/connectors/email-imap/threads?q=…`, normalized-subject grouping) and Assign-from-feed sending (`POST /api/connectors/email-imap/send`). Config: host/port/user/pass via connector config, `CADENCE_IMAP_*` env, `data/imap.json` (gitignored), or GNOME Online Accounts (`goa_account` selection; OAuth2 → XOAUTH2, creds never stored). Read-only, except Sent-filing after a send. |
 | `webhook` | inbound | External systems `POST /api/hooks/:key` with `{kpi_id, date, value, note}`. Keys live in its connector config: `{keys: {"<uuid>": {"label": "..."}}}`. `sync()` is a no-op. |
 
 ## Testing a new connector

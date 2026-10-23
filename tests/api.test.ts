@@ -7,7 +7,8 @@ import { createApp } from "../src/server.ts";
 import { connectors } from "../src/connectors/index.ts";
 import { _test as imapTest } from "../src/connectors/email-imap.ts";
 import { keyIsValid } from "../src/connectors/webhook.ts";
-import { listGoaMailAccounts, getGoaCredentials, goaImapCfg, goaAvailable } from "../src/goa.ts";
+import { listGoaMailAccounts, getGoaCredentials, goaImapCfg, goaAvailable, goaSmtpCfg } from "../src/goa.ts";
+import { _test as smtpTest, resolveSmtpConfig } from "../src/connectors/email-smtp.ts";
 
 let app: ReturnType<typeof createApp>;
 let tmp: string;
@@ -502,5 +503,309 @@ describe("task links", () => {
     const empty = await call("GET", "/api/connectors/email-imap/threads");
     expect(empty.status).toBe(200);
     expect(empty.data.threads).toEqual([]);
+  });
+});
+
+describe("email-smtp", () => {
+  // Mock line I/O: scripted server lines, records everything the client wrote.
+  const mockIO = (script: string[]) => {
+    const sent: string[] = [];
+    const queue = [...script];
+    return {
+      sent,
+      io: {
+        write: (d: string) => { sent.push(d); },
+        readLine: async () => {
+          if (!queue.length) throw new Error("mock-smtp: script exhausted");
+          return queue.shift()!;
+        },
+        startTls: async (_h: string) => { sent.push("[starttls-upgrade]"); },
+        close: () => {},
+      },
+    };
+  };
+  const loginCfg: any = {
+    host: "smtp.example.com", port: 587, user: "me@example.com",
+    pass: "pw", auth: "login", secure: "starttls",
+  };
+
+  test("STARTTLS + AUTH LOGIN command sequence", async () => {
+    const { io, sent } = mockIO([
+      "220 smtp.example.com ESMTP",
+      "250-smtp.example.com", "250 STARTTLS",
+      "220 2.0.0 Ready",
+      "250-smtp.example.com", "250 AUTH",
+      "334 VXNlcm5hbWU6", "334 UGFzc3dvcmQ6", "235 2.7.0 Authenticated",
+      "250 2.1.0 Ok", "250 2.1.5 Ok", "354 End data",
+      "250 2.0.0 Ok: queued", "221 2.0.0 Bye",
+    ]);
+    await new smtpTest.SmtpSession(io as any).send(loginCfg, {
+      to: ["a@x.com"], raw: "Subject: Hi\r\n\r\nbody\r\n",
+    });
+    const writes = sent.join("\n");
+    const order = ["EHLO", "STARTTLS", "[starttls-upgrade]", "EHLO", "AUTH LOGIN",
+      Buffer.from("me@example.com").toString("base64"),
+      Buffer.from("pw").toString("base64"),
+      "MAIL FROM:<me@example.com>", "RCPT TO:<a@x.com>", "DATA", "QUIT"];
+    let idx = -1;
+    for (const w of order) {
+      const at = writes.indexOf(w, idx + 1);
+      expect(at).toBeGreaterThan(idx);
+      idx = at;
+    }
+  });
+
+  test("XOAUTH2 auth path (implicit TLS, no STARTTLS)", async () => {
+    const { io, sent } = mockIO([
+      "220 hi",
+      "250-smtp.example.com", "250 AUTH",
+      "235 2.7.0 ok", "250 ok", "250 ok", "354 go", "250 queued", "221 bye",
+    ]);
+    const cfg = { ...loginCfg, port: 465, secure: "ssl", auth: "xoauth2", pass: "tok123" };
+    await new smtpTest.SmtpSession(io as any).send(cfg, {
+      to: ["a@x.com"], raw: "Subject: Hi\r\n\r\nbody\r\n",
+    });
+    const authLine = sent.find((s) => s.startsWith("AUTH XOAUTH2 "));
+    expect(authLine).toBeTruthy();
+    expect(Buffer.from(authLine!.slice("AUTH XOAUTH2 ".length).trim(), "base64").toString("utf8"))
+      .toBe("user=me@example.com\x01auth=Bearer tok123\x01\x01");
+    expect(sent.some((s) => s.startsWith("AUTH LOGIN"))).toBe(false);
+    expect(sent.some((s) => s.startsWith("STARTTLS"))).toBe(false);
+  });
+
+  test("DATA dot-stuffing", async () => {
+    const { io, sent } = mockIO([
+      "220 hi",
+      "250-smtp.example.com", "250 AUTH",
+      "334 VXNlcm5hbWU6", "334 UGFzc3dvcmQ6", "235 ok",
+      "250 ok", "250 ok", "354 go", "250 queued", "221 bye",
+    ]);
+    await new smtpTest.SmtpSession(io as any).send({ ...loginCfg, secure: "ssl" }, {
+      to: ["a@x.com"], raw: "Subject: x\r\n\r\n.line starts with dot\r\n",
+    });
+    const dataChunk = sent.find((s) => s.includes("line starts with dot"));
+    expect(dataChunk).toContain("\r\n..line starts with dot\r\n");
+    expect(dataChunk!.endsWith("\r\n.\r\n")).toBe(true);
+  });
+
+  test("auth failure surfaces a human message", async () => {
+    const { io } = mockIO([
+      "220 hi",
+      "250-smtp.example.com", "250 AUTH",
+      "334 VXNlcm5hbWU6", "334 UGFzc3dvcmQ6", "535 5.7.8 bad credentials",
+    ]);
+    await expect(new smtpTest.SmtpSession(io as any).send(
+      { ...loginCfg, secure: "ssl" }, { to: ["a@x.com"], raw: "x\r\n" })
+    ).rejects.toThrow(/smtp authentication failed/);
+  });
+
+  test("buildMessage headers + Message-ID + subject encoding", () => {
+    const { raw, messageId } = smtpTest.buildMessage({
+      from: "me@example.com", to: ["a@x.com", "b@x.com"],
+      subject: "Kïckoff ✓", body: "line1\nline2",
+    });
+    expect(messageId).toMatch(/^<.+@cadence>$/);
+    expect(raw).toContain(`Message-ID: ${messageId}`);
+    expect(raw).toContain("From: me@example.com");
+    expect(raw).toContain("To: a@x.com, b@x.com");
+    expect(raw).toContain("Subject: =?UTF-8?B?");
+    expect(raw).toContain("line1\r\nline2");
+    const ascii = smtpTest.buildMessage({ from: "m@x.c", to: ["a@x.c"], subject: "Plain", body: "b" });
+    expect(ascii.raw).toContain("Subject: Plain");
+    expect(smtpTest.encodeHeader("plain")).toBe("plain");
+  });
+
+  test("resolveSmtpConfig: explicit wins, GOA never consulted", async () => {
+    let listed = false;
+    const goaFns = {
+      listGoaMailAccounts: async () => { listed = true; return [] as any[]; },
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    const c = await resolveSmtpConfig(
+      { smtp_host: "h", smtp_user: "u", smtp_pass: "p", smtp_port: 465, smtp_secure: "ssl" }, goaFns);
+    expect(c.host).toBe("h");
+    expect(c.port).toBe(465);
+    expect(c.secure).toBe("ssl");
+    expect(c.auth).toBe("login");
+    expect(listed).toBe(false);
+  });
+
+  test("resolveSmtpConfig: GOA absent → human-readable error", async () => {
+    const empty = {
+      listGoaMailAccounts: async () => [] as any[],
+      getGoaCredentials: async (_a: any) => { throw new Error("unused"); },
+    };
+    await expect(resolveSmtpConfig({}, empty)).rejects.toThrow(/missing SMTP credentials/);
+  });
+
+  test("resolveSmtpConfig: GOA OAuth2 → xoauth2 (587/starttls)", async () => {
+    const acct: any = {
+      objectPath: "/p/1", id: "goa_account_1", email: "user@gmail.com",
+      smtpHost: "smtp.gmail.com", smtpUser: "user@gmail.com", smtpSsl: false, smtpTls: true,
+    };
+    const fns = {
+      listGoaMailAccounts: async () => [acct],
+      getGoaCredentials: async (_a: any) => ({ user: "user@gmail.com", oauth2: true, token: "tok" }),
+    };
+    const c = await resolveSmtpConfig({}, fns as any);
+    expect(c).toMatchObject({ host: "smtp.gmail.com", port: 587, user: "user@gmail.com", auth: "xoauth2", secure: "starttls" });
+    expect(c.pass).toBe("tok");
+  });
+
+  test("resolveSmtpConfig: GOA password → login (prefers smtp-password)", async () => {
+    const acct: any = {
+      objectPath: "/p/1", id: "goa_account_9", email: "u@x.com",
+      smtpHost: "smtp.x.com", smtpUser: "u@x.com", smtpSsl: true, smtpTls: false,
+    };
+    const fns = {
+      listGoaMailAccounts: async () => [acct],
+      getGoaCredentials: async (_a: any) => ({ user: "u@x.com", oauth2: false, imapPassword: "ipw", smtpPassword: "spw" }),
+    };
+    const c = await resolveSmtpConfig({}, fns as any);
+    expect(c).toMatchObject({ port: 465, secure: "ssl", auth: "login" });
+    expect(c.pass).toBe("spw");
+  });
+
+  test("goaSmtpCfg maps ssl→465, tls→587, refuses unencrypted", () => {
+    const base: any = { email: "u@x.com", smtpHost: "smtp.x.com", smtpUser: "u@x.com" };
+    expect(goaSmtpCfg({ ...base, smtpSsl: true })).toEqual(
+      { host: "smtp.x.com", port: 465, user: "u@x.com", secure: "ssl" });
+    expect(goaSmtpCfg({ ...base, smtpSsl: false, smtpTls: true })).toEqual(
+      { host: "smtp.x.com", port: 587, user: "u@x.com", secure: "starttls" });
+    expect(() => goaSmtpCfg({ ...base, smtpSsl: false, smtpTls: false })).toThrow(/unencrypted/);
+    expect(() => goaSmtpCfg({ ...base, smtpHost: "" })).toThrow(/no SMTP host/);
+  });
+});
+
+describe("assign from feed (send endpoint)", () => {
+  let app2: ReturnType<typeof createApp>;
+  let tmp2: string;
+  let run2 = "";
+  let task2 = "";
+  const smtpSent: string[] = [];
+  // Command-driven mock: answers based on the last client command, so any
+  // recipient count works.
+  const smtpMockIO = () => {
+    let reads = 0;
+    let ehloCount = 0;
+    const pending: string[] = [];
+    const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+    return {
+      write: (d: string) => { smtpSent.push(d); },
+      readLine: async () => {
+        reads++;
+        if (reads === 1) return "220 smtp.example.com ESMTP";
+        if (pending.length) return pending.shift()!;
+        const last = (smtpSent[smtpSent.length - 1] || "").split("\r\n")[0];
+        if (last === "EHLO cadence.local") {
+          ehloCount++;
+          pending.push(...(ehloCount === 1
+            ? ["250-smtp.example.com", "250 STARTTLS"]
+            : ["250-smtp.example.com", "250-AUTH LOGIN", "250 HELP"]));
+          return pending.shift()!;
+        }
+        if (last === "STARTTLS") return "220 2.0.0 Ready";
+        if (last === "AUTH LOGIN") return "334 VXNlcm5hbWU6";
+        if (last === b64("me@example.com")) return "334 UGFzc3dvcmQ6";
+        if (last === b64("pw")) return "235 2.7.0 ok";
+        if (last.startsWith("MAIL FROM:")) return "250 2.1.0 Ok";
+        if (last.startsWith("RCPT TO:")) return "250 2.1.5 Ok";
+        if (last === "DATA") return "354 End data";
+        if ((smtpSent[smtpSent.length - 1] || "").includes("\r\n.\r\n"))
+          return "250 2.0.0 Ok: queued";
+        if (last === "QUIT") return "221 2.0.0 Bye";
+        throw new Error("mock-smtp: unexpected command: " + last.slice(0, 60));
+      },
+      startTls: async (_h: string) => {},
+      close: () => {},
+    };
+  };
+  async function call2(method: string, path: string, body?: any) {
+    const res = await app2.fetch(new Request(`http://localhost${path}`, {
+      method, headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }));
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  }
+  const smtpCfg = { smtp_host: "smtp.example.com", smtp_port: 587, smtp_user: "me@example.com", smtp_pass: "pw" };
+
+  beforeAll(async () => {
+    tmp2 = mkdtempSync(join(tmpdir(), "cadence-send-"));
+    app2 = createApp({
+      dbPath: join(tmp2, "test.db"),
+      smtpIoFactory: async () => smtpMockIO(),
+    });
+    const pb = await call2("GET", "/api/playbooks");
+    const r = await call2("POST", "/api/runs", {
+      playbook_id: pb.data[0].id, name: "Send run", start_date: today(),
+    });
+    run2 = r.data.id;
+    const dash = await call2("GET", `/api/runs/${run2}`);
+    task2 = dash.data.weeks[0].roles.CEO[0].id;
+    await call2("POST", "/api/connectors/email-imap", { config: smtpCfg });
+  });
+  afterAll(() => {
+    app2.close();
+    rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  const sendBody = (over: any = {}) => ({
+    to: ["a@x.com"], subject: "Kickoff", body: "Hello", task_id: task2, run_id: run2, ...over,
+  });
+
+  test("validation: 400s", async () => {
+    expect((await call2("POST", "/api/connectors/email-imap/send", sendBody({ to: [] }))).status).toBe(400);
+    expect((await call2("POST", "/api/connectors/email-imap/send", sendBody({ to: ["not-an-email"] }))).status).toBe(400);
+    expect((await call2("POST", "/api/connectors/email-imap/send", sendBody({ subject: "  " }))).status).toBe(400);
+    expect((await call2("POST", "/api/connectors/email-imap/send", sendBody({ body: "" }))).status).toBe(400);
+  });
+
+  test("404 when task is not in the run", async () => {
+    const pb = await call2("GET", "/api/playbooks");
+    const r2 = await call2("POST", "/api/runs", { playbook_id: pb.data[0].id, start_date: today() });
+    const otherTask = (await call2("GET", `/api/runs/${r2.data.id}`)).data.weeks[0].roles.CEO[0].id;
+    expect((await call2("POST", "/api/connectors/email-imap/send",
+      sendBody({ task_id: otherTask }))).status).toBe(404);
+  });
+
+  test("400 when SMTP unconfigured", async () => {
+    await call2("POST", "/api/connectors/email-imap", { config: {} }); // wipe explicit config
+    const r = await call2("POST", "/api/connectors/email-imap/send", sendBody());
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/missing SMTP credentials/);
+    await call2("POST", "/api/connectors/email-imap", { config: smtpCfg }); // restore
+  });
+
+  test("successful send: thread linked, contacts upserted, SMTP saw it", async () => {
+    const r = await call2("POST", "/api/connectors/email-imap/send",
+      sendBody({ to: ["b@x.com", "a@x.com"], subject: "Delivery Kickoff" }));
+    expect(r.status).toBe(201);
+    expect(r.data.message_id).toMatch(/^<.+@cadence>$/);
+    expect(r.data.link_id).toBeTruthy();
+    const dash = await call2("GET", `/api/runs/${run2}`);
+    const t = dash.data.weeks[0].roles.CEO.find((x: any) => x.id === task2);
+    const link = t.links[0]; // newest first
+    expect(link.source).toBe("email-imap");
+    expect(link.kind).toBe("thread");
+    expect(link.ref).toBe("delivery kickoff");
+    expect(link.label).toBe("Delivery Kickoff");
+    expect(link.meta.message_id).toBe(r.data.message_id);
+    expect(link.meta.from).toBe("me@example.com");
+    expect(link.meta.count).toBe(1);
+    const c = await call2("GET", "/api/email-contacts");
+    expect(c.status).toBe(200);
+    expect(new Set(c.data.contacts.map((x: any) => x.email))).toEqual(new Set(["a@x.com", "b@x.com"]));
+    expect(smtpSent.some((s) => s.startsWith("MAIL FROM:<me@example.com>"))).toBe(true);
+    expect(smtpSent.some((s) => s.startsWith("RCPT TO:<b@x.com>"))).toBe(true);
+    expect(smtpSent.some((s) => s.startsWith("RCPT TO:<a@x.com>"))).toBe(true);
+  });
+
+  test("contact reuse bumps last_used (most recent first, no dupes)", async () => {
+    await call2("POST", "/api/connectors/email-imap/send", sendBody({ to: ["a@x.com"], subject: "Second" }));
+    const c = await call2("GET", "/api/email-contacts");
+    const emails = c.data.contacts.map((x: any) => x.email);
+    expect(emails[0]).toBe("a@x.com");
+    expect(emails).toContain("b@x.com");
+    expect(new Set(emails).size).toBe(emails.length);
   });
 });

@@ -288,6 +288,24 @@ class Conn {
     try { this.sock.write("a999 LOGOUT\r\n"); } catch { /* gone */ }
     try { this.sock.end(); } catch { /* gone */ }
   }
+
+  /** APPEND a message to a folder: literal handshake, then the exact bytes. */
+  async append(tag: string, folder: string, raw: string): Promise<void> {
+    const n = Buffer.byteLength(raw, "utf8");
+    this.sock.write(`${tag} APPEND ${qstr(folder)} (\\Seen) {${n}}\r\n`);
+    const cont = await this.readLine();
+    if (!cont.startsWith("+")) {
+      throw new ImapError(`imap APPEND not accepted: ${cont.slice(0, 120)}`);
+    }
+    this.sock.write(raw);
+    for (;;) {
+      const line = await this.readLine();
+      if (line.startsWith(`${tag} `)) {
+        if (/^OK\b/i.test(line.slice(tag.length + 1))) return;
+        throw new ImapError(`imap APPEND failed: ${line.slice(0, 120)}`);
+      }
+    }
+  }
 }
 
 const qstr = (s: string) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -437,3 +455,23 @@ export const connector = {
 
 // Exported for tests (pure helpers, no network).
 export const _test = { imapDate, internalDateToIso, resolveConfig, normalizeSubject, decodeHeader, xoauth2Blob };
+
+/** APPEND a raw RFC 5322 message to the Sent folder (files a sent message so
+ *  it shows up in sent-mail and in later thread searches). Read-write, unlike
+ *  the rest of this module — used only right after a successful SMTP send. */
+export async function appendToSent(opts: { config: any; raw: string }): Promise<void> {
+  const cfg = await resolveConfig(opts.config); // throws human-readable ImapError when missing
+  const conn = new Conn();
+  await conn.open(cfg.host, cfg.port);
+  try {
+    const greet = await conn.greeting();
+    if (!/^\* OK/i.test(greet)) throw new ImapError("imap server did not greet");
+    await authenticate(conn, "p001", cfg);
+    const folder = cfg.folder || (await findSentFolder(conn));
+    if (!folder) throw new ImapError("imap: could not find a Sent folder");
+    const raw = opts.raw.endsWith("\r\n") ? opts.raw : opts.raw + "\r\n";
+    await conn.append("p002", folder, raw);
+  } finally {
+    conn.close();
+  }
+}

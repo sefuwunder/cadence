@@ -14,7 +14,7 @@ opens into a two-pane layout on tablet (≥900px).
 cd cadence
 bun install   # no-op: zero dependencies, but keeps bun happy
 bun start     # → http://127.0.0.1:3040
-bun test      # 22 tests, all green
+bun test          # 58 tests, all green
 ```
 
 Data lives in `data/cadence.db` (created on first run). Override with `CADENCE_DATA_DIR`.
@@ -41,6 +41,16 @@ webhook records) with source badges, plus unlink buttons.
   no JWZ). Linking a thread stores one row (`kind: thread`, ref = the normalized
   subject, meta carries from/date/message count). One row per thread, manual
   linking only (no auto-rules in v1).
+- **Assign from feed** — start an email thread with contact(s) right from the
+  task: To (comma-separated, with a datalist of recent contacts), Subject
+  (prefilled with the task title), Message, Send. The message goes out through
+  the configured SMTP backend (explicit `smtp_*` config, `CADENCE_SMTP_*` env,
+  `data/imap.json`, or the same GNOME Online Account as IMAP — OAuth2 via
+  XOAUTH2), is then APPENDed into the Sent folder so it shows in sent-mail and
+  later thread searches, and is auto-linked into the feed as
+  `kind: thread` (meta: from/to/date/count/message_id). Contacts are remembered
+  (`email_contacts`, most-recently-used first). Sending is always user-initiated
+  — the Send button is the confirmation; nothing auto-sends.
 - **Manual note** — free-text note linked as `source: manual, kind: note`.
 - **Webhook** — any system can post to a task’s feed: `POST /api/hooks/:key`
   `{ "task_id", "kind", "ref", "label", "meta"? }`.
@@ -114,6 +124,11 @@ GET                 /api/connectors/email-imap/threads?q=…[&folder=…]
 GET                 /api/connectors/email-imap/goa-accounts
                       → { available, accounts: [{ id, email, provider }] }
                       (never 500s; GOA absent → { available: false, accounts: [] })
+POST                /api/connectors/email-imap/send   {to: string[], subject, body, task_id, run_id}
+                                                  → 201 { link_id, message_id } (sends via SMTP, files in
+                                                  Sent, upserts contacts, links thread into task feed;
+                                                  400 validation / SMTP unconfigured, 404 task not in run)
+GET                 /api/email-contacts           → { contacts: [{ email, name, last_used }] } (MRU, ≤20)
 POST                /api/kpis/:kpiId/entries  {date, value, note?}   (source: manual)
 DELETE              /api/kpis/:kpiId/entries/:entryId
 GET/POST            /api/connectors           (list; save config)

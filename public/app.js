@@ -421,6 +421,7 @@ async function feedSheet(taskId) {
     <h3 style="margin-top:20px">Add to feed</h3>
     <div class="pills" id="ev-src">
       <button class="pill active" data-evsrc="email">Email</button>
+      <button class="pill" data-evsrc="assign">Assign</button>
       <button class="pill" data-evsrc="manual">Manual note</button>
       <button class="pill" data-evsrc="webhook">Webhook</button>
     </div>
@@ -475,6 +476,47 @@ function evForm(taskId, src) {
   "ref": "ext-123", "label": "CRM opportunity closed" }</div>
         ${keys.length ? "" : `<p class="meta" style="color:var(--muted);font-size:13px;margin-top:8px">Generate a key under KPIs → Connectors → Inbound webhook.</p>`}`;
     }).catch((e) => { f.innerHTML = `<p class="meta">${esc(e.message)}</p>`; });
+  } else if (src === "assign") {
+    // Assign from feed — start an email thread with contact(s). The Send
+    // button is the confirmation; nothing is sent until it is tapped.
+    const task = findTask(taskId);
+    f.innerHTML = `<p class="meta" style="color:var(--muted);font-size:13px">Assign from feed — start an email thread with contact(s). Sent from your mail account, then linked here.</p>
+      <div class="field"><label>To</label>
+        <input id="f-to" list="f-contacts" placeholder="name@company.com, …" autocomplete="off">
+        <datalist id="f-contacts"></datalist></div>
+      <div class="field"><label>Subject</label>
+        <input id="f-subject" value="${esc(task?.title || "")}"></div>
+      <div class="field"><label>Message</label>
+        <textarea id="f-body" rows="4" placeholder="Write the first message…"></textarea></div>
+      <button class="btn" id="f-send">Send</button>`;
+    api("/api/email-contacts").then((r) => {
+      const dl = $("#f-contacts");
+      if (dl && r.contacts) {
+        dl.innerHTML = r.contacts.map((c) =>
+          `<option value="${esc(c.email)}">${esc(c.name || c.email)}</option>`).join("");
+      }
+    }).catch(() => { /* datalist is a nicety, not a gate */ });
+    $("#f-send").onclick = async () => {
+      const to = $("#f-to").value.split(",").map((s) => s.trim()).filter(Boolean);
+      const subject = $("#f-subject").value.trim();
+      const body = $("#f-body").value.trim();
+      if (!to.length) { alert("Add at least one recipient"); return; }
+      if (!subject) { alert("Subject is required"); return; }
+      if (!body) { alert("Write a message first"); return; }
+      const btn = $("#f-send");
+      btn.disabled = true;
+      btn.textContent = "Sending…";
+      try {
+        await api("/api/connectors/email-imap/send", "POST",
+          { to, subject, body, task_id: taskId, run_id: state.runId });
+        await loadDash();
+        feedSheet(taskId); // links are newest-first, so the thread lands on top
+      } catch (e) {
+        alert(e.message);
+        btn.disabled = false;
+        btn.textContent = "Send";
+      }
+    };
   } else {
     f.innerHTML = `<div class="field"><label>Search email threads</label>
       <input id="f-q" placeholder="e.g. Delivery Kickoff" autocomplete="off"></div>
