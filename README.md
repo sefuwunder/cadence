@@ -14,7 +14,7 @@ opens into a two-pane layout on tablet (≥900px).
 cd cadence
 bun install   # no-op: zero dependencies, but keeps bun happy
 bun start     # → http://127.0.0.1:3040
-bun test          # 83 tests, all green
+bun test          # 156 tests, all green
 ```
 
 Data lives in `data/cadence.db` (created on first run). Override with `CADENCE_DATA_DIR`.
@@ -90,6 +90,53 @@ under "Needs attention". Pure date math, no AI.
 threads: [{task_id, task_title, subject, last_date, unseen}],
 tasks: [{task_id, title, role, week}]}]`, sorted by recency (thread count, then
 email, break ties).
+
+## Illiad
+
+Illiad is the C-suite assistant living in the sixth tab. A chief of staff for
+the run: it **automates** (log numbers, mark tasks done, create tasks, sync
+feeds), **analyzes** (KPI pacing vs prorated week targets, wins, risks,
+momentum), and **encourages** — a state-of-play brief that leads with genuine
+progress and frames gaps as moves, never cheerleading.
+
+Deterministic and local: a keyword/regex intent router over the run's own data
+layer (no AI service, no network calls beyond the connectors you configure).
+The three verbs are the contract — everything Illiad says is computed from
+your playbook data.
+
+Example utterances:
+
+- "Brief me" / "How are we doing?" — the state-of-play brief: daypart
+  greeting → wins (real numbers) → KPI pacing (honest about what's behind) →
+  nudges (max 3) → one suggested focus → encouraging close
+- "How are SQLs doing?" — pacing for one KPI (fuzzy name matching: "sqls",
+  "discovery", "outreach", "anchor packages", "seats" all resolve)
+- "What's stalled?" — tasks gone quiet
+- "Sync feeds" — pull replies into linked threads
+- "Any new replies?" — unread thread activity
+- "How's Acme?" — a stakeholder's threads and tasks
+- "Log 5 discovery calls" — record a KPI number (source: `illiad`)
+- "Mark onboarding checklist done" — complete a task (fuzzy title match)
+- "Add task draft SOW week 2 for CRO" — create a task
+- "Motivate me" — the real picture, grounded in numbers
+- "Help" — everything Illiad can do
+
+`POST /api/illiad/ask { message, run_id? }` → `{ reply, intent }` — plain text,
+`\n\n` paragraphs, `*bold*` used sparingly, no emojis. `run_id` defaults to
+the most recent active run (404 when there is none). Write intents execute
+against the data layer and report what changed. There are no destructive
+intents — nothing deletes.
+
+Code: `src/illiad/` — `intents.ts` (parser + fuzzy slot helpers), `analyze.ts`
+(pure pacing/wins/risks/momentum), `brief.ts` (the voice), `ask.ts` (intent →
+data wiring). The server reuses the same `getDashboard` / `getStakeholders` /
+`syncRunFeeds` the UI routes use, so Illiad can never disagree with the tabs.
+
+**LLM extension point (not built):** `askIlliad` returns `{ reply, intent }`
+after executing deterministically. A future LLM layer could sit in front as a
+rephraser — taking the computed brief/numbers and restating them — but the
+numbers must always come from `analyze.ts`, never from the model. The router
+stays the source of truth for what gets *done*.
 
 ## Connectors
 
@@ -173,6 +220,8 @@ POST                /api/connectors/email-imap/send   {to: string[], subject, bo
                                                   Sent, upserts contacts, links thread into task feed;
                                                   400 validation / SMTP unconfigured, 404 task not in run)
 GET                 /api/email-contacts           → { contacts: [{ email, name, last_used }] } (MRU, ≤20)
+POST                /api/illiad/ask               { message, run_id? } → { reply, intent }
+                                                  (run_id defaults to most recent active run; 404 when none)
 POST                /api/kpis/:kpiId/entries  {date, value, note?}   (source: manual)
 DELETE              /api/kpis/:kpiId/entries/:entryId
 GET/POST            /api/connectors           (list; save config)
@@ -191,8 +240,11 @@ clamped to `1..N` so future/past runs still render.
 src/server.ts            REST API + static serving (createApp({dbPath}) for tests)
 src/db.ts                schema + seedIfEmpty
 src/seed.ts              "30-Day Sprint — $60k & 20 SQLs" template
+src/illiad/              C-suite assistant: intents.ts (parser) · analyze.ts
+                         (pacing/wins/risks/momentum) · brief.ts (voice) · ask.ts
 src/connectors/          auto-loaded connector modules + README.md
 public/                  index.html · styles.css · app.js (vanilla, no build step)
-tests/api.test.ts        bun test suite
+tests/api.test.ts        bun test suite (API + connectors)
+tests/illiad.test.ts     Illiad: intent table, pacing math, brief voice, endpoint
 data/                    sqlite db + imap.json (gitignored)
 ```

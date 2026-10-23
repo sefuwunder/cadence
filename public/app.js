@@ -27,6 +27,7 @@ const TABS = [
   ["playbook", "▤", "Playbook"],
   ["kpis", "◔", "KPIs"],
   ["activity", "≋", "Activity"],
+  ["illiad", "✦", "Illiad"],
   ["people", "◍", "People"],
 ];
 
@@ -127,7 +128,7 @@ function kpiGlance(k) {
 function render() {
   if (!state.dash) return;
   renderSideFoot();
-  ({ today: renderToday, playbook: renderPlaybook, kpis: renderKpis, activity: renderActivity, people: renderPeople })[state.tab]();
+  ({ today: renderToday, playbook: renderPlaybook, kpis: renderKpis, activity: renderActivity, illiad: renderIlliad, people: renderPeople })[state.tab]();
   // wire toggles (event delegation once)
 }
 
@@ -297,6 +298,59 @@ async function renderPeople() {
     const d = $(`#person-${r.dataset.person}`);
     if (d) d.hidden = !d.hidden;
   }));
+}
+
+/* ---------- illiad (C-suite assistant) ---------- */
+const ILLIAD_CHIPS = ["Brief me", "What's stalled?", "Sync feeds", "KPIs", "Any new replies?"];
+
+/* *bold* → <b>, escaped first so Illiad's plain text can't inject HTML. */
+function illiadMd(s) {
+  return esc(s).replace(/\*([^*]+)\*/g, "<b>$1</b>").replace(/\n/g, "<br>");
+}
+
+function renderIlliad() {
+  const el = $("#view-illiad");
+  if (!state.illiad) state.illiad = { msgs: [], busy: false };
+  const c = state.illiad;
+  el.innerHTML = `<h2>Illiad</h2>
+    <p class="sub">Your chief of staff — automates, analyzes, keeps the state of play positive</p>
+    <div class="chat" id="il-chat">
+      ${c.msgs.length ? "" : `<div class="chat-empty">Ask me anything about the run — try “Brief me”.</div>`}
+      ${c.msgs.map((m) => `<div class="msg ${m.who}"><div class="bubble">${illiadMd(m.text)}</div></div>`).join("")}
+    </div>
+    <div class="chips">${ILLIAD_CHIPS.map((q) =>
+      `<button class="chip" data-chip="${esc(q)}">${esc(q)}</button>`).join("")}</div>
+    <div class="chat-input">
+      <input id="il-in" placeholder="Ask Illiad…" autocomplete="off" enterkeyhint="send"${c.busy ? " disabled" : ""}>
+      <button class="btn" id="il-send">Send</button>
+    </div>`;
+  const chat = $("#il-chat");
+  chat.scrollTop = chat.scrollHeight;
+  $$("#view-illiad [data-chip]").forEach((b) =>
+    b.addEventListener("click", () => illiadAsk(b.dataset.chip)));
+  const send = () => {
+    const v = $("#il-in").value.trim();
+    if (v && !c.busy) illiadAsk(v);
+  };
+  $("#il-send").addEventListener("click", send);
+  $("#il-in").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+}
+
+async function illiadAsk(text) {
+  const c = state.illiad;
+  c.msgs.push({ who: "user", text });
+  c.busy = true;
+  renderIlliad();
+  try {
+    const r = await api("/api/illiad/ask", "POST", { message: text, run_id: state.runId });
+    c.msgs.push({ who: "illiad", text: r.reply });
+  } catch (e) {
+    c.msgs.push({ who: "illiad", text: `Sorry — ${e.message}` });
+  }
+  c.busy = false;
+  renderIlliad();
+  const inp = $("#il-in");
+  if (inp) inp.focus();
 }
 
 // ---------- sheets ----------

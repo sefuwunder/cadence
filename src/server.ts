@@ -12,6 +12,7 @@ import { searchThreads, appendToSent, normalizeSubject, syncThread, type ThreadM
 import { resolveSmtpConfig, sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
+import { askIlliad } from "./illiad/ask.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -110,8 +111,107 @@ export function parseAddr(s: any): { email: string; name: string } | null {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str) ? { email: str.toLowerCase(), name: "" } : null;
 }
 
+// ---------- stakeholders ----------
+// Per-counterparty rollup: threads + tasks involving each email address,
+// built from email_contacts and thread-link meta (from/to). Exported so
+// Illiad can answer "how's acme?" against the same data as the People tab.
+export function getStakeholders(db: Database, runId: string): any[] {
+  const tasks: any[] = db.query(
+    "SELECT id, title, role, week FROM tasks WHERE run_id = ?").all(runId);
+  const tById = new Map(tasks.map((t) => [t.id, t]));
+  const links: any[] = db.query(
+    `SELECT tl.*, t.title AS task_title FROM task_links tl
+     JOIN tasks t ON t.id = tl.task_id
+     WHERE t.run_id = ? AND tl.source = 'email-imap' AND tl.kind = 'thread'`).all(runId);
+  const contacts: any[] = db.query("SELECT email, name, last_used FROM email_contacts").all();
+  const cByEmail = new Map(contacts.map((c) => [String(c.email).toLowerCase(), c]));
+  const sh = new Map<string, any>();
+  const touch = (email: string, name: string, link: any, meta: any) => {
+    email = email.toLowerCase();
+    if (!sh.has(email)) {
+      sh.set(email, { email, name, last_used: "", threads: [], taskIds: new Set<string>() });
+    }
+    const s = sh.get(email);
+    if (name && !s.name) s.name = name;
+    const last = meta.last_date || meta.date || "";
+    s.threads.push({
+      task_id: link.task_id, task_title: link.task_title, subject: link.label,
+      last_date: last, unseen: Number(meta.unseen) || 0,
+    });
+    s.taskIds.add(link.task_id);
+    for (const cand of [last, cByEmail.get(email)?.last_used].filter(Boolean)) {
+      if (!s.last_used || cand > s.last_used) s.last_used = cand;
+    }
+  };
+  for (const l of links) {
+    const meta = JSON.parse(l.meta_json || "{}");
+    const f = parseAddr(meta.from);
+    if (f) touch(f.email, f.name, l, meta);
+    for (const t of (Array.isArray(meta.to) ? meta.to : [])) {
+      const p = parseAddr(t);
+      if (p) touch(p.email, p.name, l, meta);
+    }
+  }
+  for (const c of contacts) {
+    const email = String(c.email).toLowerCase();
+    if (!sh.has(email)) {
+      sh.set(email, { email, name: c.name || "", last_used: c.last_used || "", threads: [], taskIds: new Set() });
+    } else if (c.name && !sh.get(email).name) {
+      sh.get(email).name = c.name;
+    }
+  }
+  return [...sh.values()].map((s) => ({
+    email: s.email, name: s.name || s.email, last_used: s.last_used,
+    threads: s.threads.sort((a: any, b: any) =>
+      (a.last_date < b.last_date ? 1 : a.last_date > b.last_date ? -1 : 0)),
+    tasks: [...s.taskIds].map((id: string) => {
+      const t = tById.get(id);
+      return t ? { task_id: t.id, title: t.title, role: t.role, week: t.week } : null;
+    }).filter(Boolean),
+  })).sort((a, b) =>
+    (a.last_used < b.last_used ? 1 : a.last_used > b.last_used ? -1
+      : b.threads.length - a.threads.length || (a.email < b.email ? -1 : 1)));
+}
+
+// ---------- inbound thread sync (shared by the route and Illiad) ----------
+export async function syncRunFeeds(
+  db: Database,
+  runId: string,
+  threadFetcher?: (subject: string) => Promise<ThreadMessage[]>,
+): Promise<{ threads: number; synced: number; new_replies: number }> {
+  const run: any = db.query("SELECT id FROM runs WHERE id = ?").get(runId);
+  if (!run) throw new Error("run not found");
+  const links: any[] = db.query(
+    `SELECT tl.* FROM task_links tl JOIN tasks t ON t.id = tl.task_id
+     WHERE t.run_id = ? AND tl.source = 'email-imap' AND tl.kind = 'thread'`).all(runId);
+  const active = (l: any) => {
+    try { return JSON.parse(l.meta_json || "{}").last_date || ""; } catch { return ""; }
+  };
+  links.sort((a, b) => {
+    const ka = (active(a) || "") + "|" + (a.created_at || "");
+    const kb = (active(b) || "") + "|" + (b.created_at || "");
+    return ka < kb ? 1 : ka > kb ? -1 : 0;
+  });
+  const batch = links.slice(0, 20); // cap: most-recently-active first
+  const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
+  const config = row ? JSON.parse(row.config_json) : {};
+  let synced = 0, newReplies = 0, firstErr = "";
+  for (const l of batch) {
+    try {
+      const r = await syncThread({
+        link: { ref: l.ref, label: l.label, meta: JSON.parse(l.meta_json || "{}") },
+        config, fetchMessages: threadFetcher,
+      });
+      db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify(r.meta), l.id]);
+      synced++; newReplies += r.newCount;
+    } catch (e: any) { if (!firstErr) firstErr = e?.message || "thread sync failed"; }
+  }
+  if (batch.length && !synced) throw new Error(firstErr);
+  return { threads: batch.length, synced, new_replies: newReplies };
+}
+
 // ---------- dashboard ----------
-function getDashboard(db: Database, runId: string): any | null {
+export function getDashboard(db: Database, runId: string): any | null {
   const run: any = db.query("SELECT * FROM runs WHERE id = ?").get(runId);
   if (!run) return null;
   const pb: any = db.query("SELECT * FROM playbooks WHERE id = ?").get(run.playbook_id);
@@ -413,30 +513,13 @@ export function createApp(opts: {
       pm = path.match(/^\/api\/runs\/([^/]+)\/sync-feeds$/);
       if (pm && m === "POST") {
         const runId = decodeURIComponent(pm[1]);
-        const run: any = db.query("SELECT id FROM runs WHERE id = ?").get(runId);
-        if (!run) return err(404, "run not found");
-        const links: any[] = db.query(
-          `SELECT tl.* FROM task_links tl JOIN tasks t ON t.id = tl.task_id
-           WHERE t.run_id = ? AND tl.source = 'email-imap' AND tl.kind = 'thread'`).all(runId);
-        const active = (l: any) => {
-          try { return JSON.parse(l.meta_json || "{}").last_date || ""; } catch { return ""; }
-        };
-        links.sort((a, b) => {
-          const ka = (active(a) || "") + "|" + (a.created_at || "");
-          const kb = (active(b) || "") + "|" + (b.created_at || "");
-          return ka < kb ? 1 : ka > kb ? -1 : 0;
-        });
-        const batch = links.slice(0, 20); // cap: most-recently-active first
-        const config = imapCfgRow();
-        let synced = 0, newReplies = 0, firstErr = "";
-        for (const l of batch) {
-          try { const r = await syncOneThread(l, config); synced++; newReplies += r.newCount; }
-          catch (e: any) { if (!firstErr) firstErr = e?.message || "thread sync failed"; }
+        try {
+          return json(await syncRunFeeds(db, runId, opts.threadFetcher));
+        } catch (e: any) {
+          const msg = e?.message || "sync failed";
+          if (msg === "run not found") return err(404, msg);
+          return err(/missing IMAP credentials/.test(msg) ? 400 : 502, msg);
         }
-        if (batch.length && !synced) {
-          return err(/missing IMAP credentials/.test(firstErr) ? 400 : 502, firstErr);
-        }
-        return json({ threads: batch.length, synced, new_replies: newReplies });
       }
       pm = path.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/feed\/read$/);
       if (pm && m === "POST") {
@@ -461,62 +544,29 @@ export function createApp(opts: {
         if (!runId) return err(400, "run_id is required");
         const run: any = db.query("SELECT id FROM runs WHERE id = ?").get(runId);
         if (!run) return err(404, "run not found");
-        const tasks: any[] = db.query(
-          "SELECT id, title, role, week FROM tasks WHERE run_id = ?").all(runId);
-        const tById = new Map(tasks.map((t) => [t.id, t]));
-        const links: any[] = db.query(
-          `SELECT tl.*, t.title AS task_title FROM task_links tl
-           JOIN tasks t ON t.id = tl.task_id
-           WHERE t.run_id = ? AND tl.source = 'email-imap' AND tl.kind = 'thread'`).all(runId);
-        const contacts: any[] = db.query("SELECT email, name, last_used FROM email_contacts").all();
-        const cByEmail = new Map(contacts.map((c) => [String(c.email).toLowerCase(), c]));
-        const sh = new Map<string, any>();
-        const touch = (email: string, name: string, link: any, meta: any) => {
-          email = email.toLowerCase();
-          if (!sh.has(email)) {
-            sh.set(email, { email, name, last_used: "", threads: [], taskIds: new Set<string>() });
-          }
-          const s = sh.get(email);
-          if (name && !s.name) s.name = name;
-          const last = meta.last_date || meta.date || "";
-          s.threads.push({
-            task_id: link.task_id, task_title: link.task_title, subject: link.label,
-            last_date: last, unseen: Number(meta.unseen) || 0,
-          });
-          s.taskIds.add(link.task_id);
-          for (const cand of [last, cByEmail.get(email)?.last_used].filter(Boolean)) {
-            if (!s.last_used || cand > s.last_used) s.last_used = cand;
-          }
-        };
-        for (const l of links) {
-          const meta = JSON.parse(l.meta_json || "{}");
-          const f = parseAddr(meta.from);
-          if (f) touch(f.email, f.name, l, meta);
-          for (const t of (Array.isArray(meta.to) ? meta.to : [])) {
-            const p = parseAddr(t);
-            if (p) touch(p.email, p.name, l, meta);
-          }
+        return json({ stakeholders: getStakeholders(db, runId) });
+      }
+
+      // ----- illiad -----
+      // C-suite assistant: deterministic NL over the run's own data.
+      // run_id defaults to the most recent active run; 404 when there is none.
+      pm = path.match(/^\/api\/illiad\/ask$/);
+      if (pm && m === "POST") {
+        const b = await body(req);
+        const message = String(b?.message || "").trim();
+        if (!message) return err(400, "message is required");
+        let runId = b?.run_id ? String(b.run_id) : "";
+        if (runId) {
+          const r: any = db.query("SELECT id FROM runs WHERE id = ?").get(runId);
+          if (!r) return err(404, "run not found");
+        } else {
+          const r: any = db.query(
+            "SELECT id FROM runs WHERE status = 'active' ORDER BY start_date DESC, rowid DESC LIMIT 1").get();
+          if (!r) return err(404, "no active run");
+          runId = r.id;
         }
-        for (const c of contacts) {
-          const email = String(c.email).toLowerCase();
-          if (!sh.has(email)) {
-            sh.set(email, { email, name: c.name || "", last_used: c.last_used || "", threads: [], taskIds: new Set() });
-          } else if (c.name && !sh.get(email).name) {
-            sh.get(email).name = c.name;
-          }
-        }
-        const stakeholders = [...sh.values()].map((s) => ({
-          email: s.email, name: s.name || s.email, last_used: s.last_used,
-          threads: s.threads.sort((a: any, b: any) =>
-            (a.last_date < b.last_date ? 1 : a.last_date > b.last_date ? -1 : 0)),
-          tasks: [...s.taskIds].map((id: string) => {
-            const t = tById.get(id);
-            return t ? { task_id: t.id, title: t.title, role: t.role, week: t.week } : null;
-          }).filter(Boolean),
-        })).sort((a, b) =>
-          (a.last_used < b.last_used ? 1 : a.last_used > b.last_used ? -1
-            : b.threads.length - a.threads.length || (a.email < b.email ? -1 : 1)));
-        return json({ stakeholders });
+        const { reply, intent } = await askIlliad(db, message, { runId, threadFetcher: opts.threadFetcher });
+        return json({ reply, intent });
       }
 
       // ----- connectors -----

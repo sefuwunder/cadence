@@ -250,3 +250,20 @@ select { max-width: 46vw; }
   display: inline-block; font-size: 12px; color: var(--muted);
   border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; margin: 2px 4px 2px 0;
 }
+
+/* ---------- illiad chat ---------- */
+.chat { display: flex; flex-direction: column; gap: 10px; max-height: 54dvh; overflow-y: auto; padding: 4px 2px 12px; }
+.chat-empty { color: var(--faint); text-align: center; padding: 28px 16px; font-size: 15px; }
+.msg { display: flex; }
+.msg.user { justify-content: flex-end; }
+.msg.illiad { justify-content: flex-start; }
+.bubble { max-width: 84%; padding: 10px 14px; border-radius: 16px; font-size: 15px; line-height: 1.5; overflow-wrap: break-word; }
+.msg.user .bubble { background: var(--gold); color: #17130a; border-bottom-right-radius: 6px; }
+.msg.illiad .bubble { background: var(--ink-2); border: 1px solid var(--line); color: var(--text); border-bottom-left-radius: 6px; }
+.msg.illiad .bubble b { color: var(--gold); font-weight: 700; }
+.chips { display: flex; gap: 8px; overflow-x: auto; padding: 4px 2px 10px; scrollbar-width: none; }
+.chips::-webkit-scrollbar { display: none; }
+.chip { flex: 0 0 auto; background: var(--ink-2); border: 1px solid var(--line); color: var(--text); border-radius: 99px; padding: 8px 14px; font-size: 14px; min-height: 38px; cursor: pointer; }
+.chip:active { transform: scale(0.97); }
+.chat-input { display: flex; gap: 8px; padding-bottom: env(safe-area-inset-bottom); }
+.chat-input input { flex: 1; min-width: 0; }
