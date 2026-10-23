@@ -6,34 +6,30 @@ and fall back to initial-based avatars when none is found.
 
 ## How it works
 
-- `src/contacts.ts` — resolution chain: `contact_photos` SQLite cache
-  (30-day TTL) → EDS over the session bus via `busctl` → `null`.
-  Every external call is defensive; any failure returns null and the UI
-  shows initials. The EDS availability verdict is memoized for 60s so
-  avatar-heavy pages don't spawn a `busctl` per image on EDS-less machines.
-- `GET /api/contacts/photo?email=` — serves `image/*` bytes (browser-cached
-  24h) or 404. The frontend renders
-  `<img src="…" onerror="this.remove()">` inside the avatar, so a 404
-  reveals the initials underneath with zero JS.
-- `parseVCardPhoto` — extracts `PHOTO` from vCards: vCard 3.0 inline
-  base64 (`PHOTO;ENCODING=b;TYPE=JPEG:…`, folded lines unfolded) and
-  vCard 4.0 data URIs.
+- **Bulk sync** (`syncPhotosFromEDS` in `src/contacts.ts`): at server start
+  (background, non-fatal) and on demand via
+  `POST /api/contacts/photos/sync`. It finds enabled contacts sources by
+  scanning `~/.config/evolution/sources/*.source` (`ContactsEnabled=true`),
+  exports each with `addressbook-export --format=vcard <uid>`, indexes every
+  `EMAIL` → `PHOTO`, and upserts into the `contact_photos` table. The sync
+  endpoint returns `{books, contacts, photos, errors[]}` — verbose on
+  purpose, so a wrong CLI guess is diagnosable from the JSON alone.
+  Override the binary with `CADENCE_ADDRESSBOOK_EXPORT`, the sources dir
+  with `CADENCE_EDS_SOURCES` (tests).
+- **Serving**: `GET /api/contacts/photo?email=` reads the cache only —
+  fast, no D-Bus per avatar. 404 → the UI falls back to initials.
+  Browser-cached 24h; server cache 30 days.
+- **Frontend**: avatars render `<img src="…" loading="lazy"
+  onerror="this.remove()">` layered over the initials — a 404 reveals the
+  initials with zero JS.
+- `parseVCardPhoto` — extracts `PHOTO` from vCards: vCard 3.0 inline base64
+  (`PHOTO;ENCODING=b;TYPE=JPEG:…`, folded lines unfolded) and vCard 4.0
+  data URIs.
 
-## Wiring the EDS lookup (one step left)
+## D-Bus alternative (not implemented)
 
-The D-Bus surface of evolution-data-server can't be verified from the build
-machine — it must be read from the machine Cadence runs on:
-
-```sh
-./scripts/probe-eds.sh   # paste the whole output back
-```
-
-Then implement `edsVCardsForEmail()` in `src/contacts.ts` with the exact
-service / object-path / method the probe reveals, e.g. (shape TBD):
-
-```ts
-// per address book: call the list method with an email query,
-// collect the returned vCards, parseVCardPhoto() each
-```
-
-Until then the endpoint 404s and avatars stay initial-based — nothing breaks.
+The factory also offers `OpenAddressBook(s)→(ss)` at
+`org.gnome.evolution.dataserver.AddressBook10`
+`/org/gnome/evolution/dataserver/AddressBookFactory` for a per-email live
+lookup. The bulk export covers the need with fewer moving parts, so D-Bus
+stays a fallback option.

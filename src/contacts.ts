@@ -8,6 +8,8 @@
  * blocks on D-Bus. Every external call is defensive: any failure → null.
  */
 
+import { readFileSync, readdirSync } from "fs";
+
 export interface PhotoResult {
   mime: string;
   data: Uint8Array;
@@ -117,10 +119,171 @@ export async function edsPhotoByEmail(
   return null;
 }
 
+/** Split raw vCard export text into individual cards. */
+export function splitVCards(text: string): string[] {
+  const cards: string[] = [];
+  const re = /BEGIN:VCARD[\s\S]*?END:VCARD/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) cards.push(m[0]);
+  return cards;
+}
+
+/** Unfold a vCard's lines (continuation lines start with space/tab). */
+function unfoldVCard(card: string): string[] {
+  const out: string[] = [];
+  for (const raw of card.split(/\r?\n/)) {
+    if (/^[ \t]/.test(raw) && out.length) out[out.length - 1] += raw.slice(1);
+    else out.push(raw);
+  }
+  return out;
+}
+
+/** All EMAIL values in a card (lowercased). */
+export function vCardEmails(card: string): string[] {
+  const emails: string[] = [];
+  for (const line of unfoldVCard(card)) {
+    const m = line.match(/^EMAIL(?:;[^:]*)?:(.+)$/i);
+    if (m) {
+      const em = m[1].trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em) && !emails.includes(em)) emails.push(em);
+    }
+  }
+  return emails;
+}
+
+/** Index every EMAIL → photo in a bulk vCard export. */
+export function indexVCardPhotos(text: string): Map<string, PhotoResult> {
+  const idx = new Map<string, PhotoResult>();
+  for (const card of splitVCards(text)) {
+    const photo = parseVCardPhoto(card);
+    if (!photo) continue;
+    for (const em of vCardEmails(card)) {
+      if (!idx.has(em)) idx.set(em, photo);
+    }
+  }
+  return idx;
+}
+
+/** EDS source directory (override with CADENCE_EDS_SOURCES in tests). */
+export function edsSourcesDir(): string {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  return process.env.CADENCE_EDS_SOURCES || `${home}/.config/evolution/sources`;
+}
+
+/** UIDs of enabled contacts sources: filename stem of every *.source file
+ *  with Enabled=true and ContactsEnabled=true. */
+export function enabledContactsUids(
+  dir: string = edsSourcesDir(),
+  readFile: (p: string) => string | null = (p) => {
+    try { return readFileSync(p, "utf8"); } catch { return null; }
+  },
+  listDir: (d: string) => string[] = (d) => {
+    try { return readdirSync(d).filter((f) => f.endsWith(".source")); } catch { return []; }
+  },
+): string[] {
+  const uids: string[] = [];
+  for (const f of listDir(dir)) {
+    const txt = readFile(`${dir}/${f}`);
+    if (!txt) continue;
+    const get = (k: string) => {
+      const m = txt.match(new RegExp(`^${k}=(.*)$`, "im"));
+      return m ? m[1].trim().toLowerCase() : "";
+    };
+    if (get("Enabled") === "true" && get("ContactsEnabled") === "true") {
+      uids.push(f.replace(/\.source$/, ""));
+    }
+  }
+  return uids;
+}
+
+export interface PhotoSyncResult {
+  books: number;
+  contacts: number;
+  photos: number;
+  errors: string[];
+}
+
+function spawnCapture(cmd: string[], timeoutMs: number): Promise<{ code: number; out: string; err: string }> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (code: number, out: string, err: string) => {
+      if (done) return;
+      done = true;
+      resolve({ code, out, err });
+    };
+    try {
+      const proc = Bun.spawn(cmd, {
+        stdout: "pipe", stderr: "pipe",
+        env: { ...process.env }, // inherit session bus etc.
+      });
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch { /* gone */ }
+        finish(124, "", "timeout");
+      }, timeoutMs);
+      proc.exited.then(async (code) => {
+        clearTimeout(timer);
+        const out = await new Response(proc.stdout).text().catch(() => "");
+        const err = await new Response(proc.stderr).text().catch(() => "");
+        finish(code, out, err);
+      }).catch(() => finish(1, "", "spawn failed"));
+    } catch {
+      finish(127, "", "spawn threw");
+    }
+  });
+}
+
+/** Bulk-sync contact photos from every enabled EDS address book via
+ *  `addressbook-export`. Populates contact_photos; per-avatar requests
+ *  then hit the cache only. Never throws — errors are collected. */
+export async function syncPhotosFromEDS(
+  db: any,
+  opts: { sourcesDir?: string; exportBin?: string; timeoutMs?: number } = {},
+): Promise<PhotoSyncResult> {
+  const res: PhotoSyncResult = { books: 0, contacts: 0, photos: 0, errors: [] };
+  const bin = opts.exportBin || process.env.CADENCE_ADDRESSBOOK_EXPORT || "addressbook-export";
+  let uids: string[];
+  try {
+    uids = enabledContactsUids(opts.sourcesDir);
+  } catch (e: any) {
+    res.errors.push(`sources scan failed: ${e?.message || e}`);
+    return res;
+  }
+  if (!uids.length) {
+    res.errors.push("no enabled contacts sources found");
+    return res;
+  }
+  const now = new Date().toISOString();
+  const up = db.prepare(
+    "INSERT INTO contact_photos (email, mime, data, fetched_at) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(email) DO UPDATE SET mime = excluded.mime, data = excluded.data, fetched_at = excluded.fetched_at");
+  for (const uid of uids) {
+    const r = await spawnCapture(
+      [bin, "--format=vcard", uid], opts.timeoutMs || 60000);
+    if (r.code !== 0) {
+      res.errors.push(`${uid}: exit ${r.code}${r.err ? ` — ${r.err.trim().slice(0, 160)}` : ""}`);
+      continue;
+    }
+    res.books++;
+    const idx = indexVCardPhotos(r.out);
+    res.contacts += splitVCards(r.out).length;
+    const run = db.transaction((entries: [string, PhotoResult][]) => {
+      for (const [email, photo] of entries) {
+        up.run(email, photo.mime, Buffer.from(photo.data), now);
+      }
+    });
+    try {
+      run([...idx.entries()]);
+      res.photos += idx.size;
+    } catch (e: any) {
+      res.errors.push(`${uid}: cache write failed: ${e?.message || e}`);
+    }
+  }
+  return res;
+}
+
 /** Query every EDS address book for vCards whose EMAIL matches.
- *  Wiring needs the exact D-Bus surface from the user's machine — run
- *  scripts/probe-eds.sh there and paste the output; then implement here.
- *  Isolated so tests can stub the runner and unit-test parsing/wiring. */
+ *  Kept as the per-email D-Bus seam (factory OpenAddressBook s→ss);
+ *  the bulk export above is the primary path. Isolated for testability. */
 export async function edsVCardsForEmail(
   _email: string,
   _run: BusctlRunner = defaultBusctl,

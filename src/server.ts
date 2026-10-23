@@ -13,7 +13,7 @@ import { resolveSmtpConfig, sendWithConfig, type SmtpLineIO } from "./connectors
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
-import { getContactPhoto } from "./contacts.ts";
+import { getContactPhoto, syncPhotosFromEDS } from "./contacts.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url)); // src/
 const publicDir = join(appRoot, "..", "public");
@@ -690,10 +690,21 @@ export function createApp(opts: {
           "SELECT email, name, last_used FROM email_contacts ORDER BY last_used DESC LIMIT 20").all();
         return json({ contacts });
       }
-      // Contact photo from the system address book (GOA-synced GNOME contacts).
-      // 404 → the UI falls back to the initial-based avatar. Cached in the
-      // browser for a day; the server cache (contact_photos) is 30 days.
+      // Bulk-sync contact photos from every enabled EDS address book
+      // (GOA-synced GNOME contacts) into the photo cache. Verbose result
+      // so CLI-shape problems are diagnosable from the JSON alone.
+      if (path === "/api/contacts/photos/sync" && m === "POST") {
+        const res = await syncPhotosFromEDS(db);
+        db.run(
+          "INSERT INTO connector_cfg (id, name, config_json) VALUES ('contact-photos', 'Contact photos', ?) " +
+          "ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+          [JSON.stringify({ last_sync: new Date().toISOString() })]);
+        return json(res);
+      }
       if (path === "/api/contacts/photo" && m === "GET") {
+        // Single photo from the cache (populated by the bulk sync above).
+        // 404 → the UI falls back to the initial-based avatar. The browser
+        // caches hits for a day; the server cache is 30 days.
         const email = url.searchParams.get("email") || "";
         const photo = await getContactPhoto(db, email);
         if (!photo) return err(404, "no photo");
@@ -863,4 +874,12 @@ if (import.meta.main) {
   const port = Number(process.env.CADENCE_PORT || 3040);
   Bun.serve({ port, hostname: "127.0.0.1", fetch: app.fetch });
   console.log(`[cadence] http://127.0.0.1:${port} (data: ${dataDir})`);
+  // Bulk-sync contact photos in the background (GOA-synced address books).
+  // Non-fatal: avatars fall back to initials until the cache fills.
+  syncPhotosFromEDS(app.db).then((r) => {
+    if (r.photos > 0 || r.errors.length) {
+      console.log(`[cadence] contact photos: ${r.photos} cached from ${r.books} books` +
+        (r.errors.length ? ` (${r.errors.length} errors)` : ""));
+    }
+  }).catch((e) => console.error("[cadence] photo sync failed:", e?.message || e));
 }

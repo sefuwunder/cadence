@@ -1332,3 +1332,88 @@ describe("contact photos", () => {
     expect(calls).toBe(before); // verdict memoized; stub lookup is cheap/local
   });
 });
+
+describe("contact photo bulk sync", () => {
+  test("splitVCards / vCardEmails / indexVCardPhotos", async () => {
+    const m = await import("../src/contacts.ts");
+    const jpeg = Buffer.from([0xff, 0xd8]).toString("base64");
+    const text = [
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Jane Doe", "EMAIL:jane@acme.com",
+      `PHOTO;ENCODING=b;TYPE=JPEG:${jpeg}`, "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Bob", "EMAIL;TYPE=WORK:bob@acme.com",
+      "EMAIL:bobby@acme.com", "END:VCARD",
+    ].join("\n");
+    expect(m.splitVCards(text).length).toBe(2);
+    expect(m.vCardEmails(m.splitVCards(text)[1])).toEqual(["bob@acme.com", "bobby@acme.com"]);
+    const idx = m.indexVCardPhotos(text);
+    expect(idx.size).toBe(1); // only Jane has a photo; both of Bob's emails absent
+    expect(idx.get("jane@acme.com")!.mime).toBe("image/jpeg");
+  });
+
+  test("enabledContactsUids parses source files", async () => {
+    const m = await import("../src/contacts.ts");
+    const files: Record<string, string> = {
+      "aaa.source": "DisplayName=g@gmail.com\nEnabled=true\nContactsEnabled=true\n",
+      "bbb.source": "DisplayName=x\nEnabled=true\nContactsEnabled=false\n",
+      "ccc.source": "DisplayName=y\nEnabled=false\nContactsEnabled=true\n",
+    };
+    const uids = m.enabledContactsUids("/fake",
+      (p: string) => files[p.split("/").pop()!] ?? null,
+      () => Object.keys(files));
+    expect(uids).toEqual(["aaa"]);
+  });
+
+  test("syncPhotosFromEDS with a stub export binary", async () => {
+    const m = await import("../src/contacts.ts");
+    const jpeg = Buffer.from([0xff, 0xd8]).toString("base64");
+    const fakeBin = "/tmp/fake-ab-export.sh";
+    await Bun.write(fakeBin,
+      `#!/bin/sh\nif [ "$1" = "--format=vcard" ]; then printf 'BEGIN:VCARD\\nFN:Erin\\nEMAIL:erin@acme.com\\nPHOTO;ENCODING=b;TYPE=JPEG:${jpeg}\\nEND:VCARD\\n'; exit 0; fi\nexit 3\n`);
+    const { chmodSync } = await import("fs");
+    chmodSync(fakeBin, 0o755);
+    const files: Record<string, string> = {
+      "u1.source": "Enabled=true\nContactsEnabled=true\n",
+    };
+    // point sync at the stub via env override of the binary + stubbed dir scan
+    const origBin = process.env.CADENCE_ADDRESSBOOK_EXPORT;
+    process.env.CADENCE_ADDRESSBOOK_EXPORT = fakeBin;
+    const origScan = m.enabledContactsUids;
+    try {
+      // monkey-patch the sources dir through env is not enough for listDir;
+      // call the internals via a temp sources dir instead
+      const dir = "/tmp/fake-eds-sources";
+      const { mkdirSync, writeFileSync, rmSync } = await import("fs");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${dir}/u1.source`, files["u1.source"]);
+      const res = await m.syncPhotosFromEDS(app.db, { sourcesDir: dir });
+      expect(res.books).toBe(1);
+      expect(res.photos).toBe(1);
+      expect(res.errors).toEqual([]);
+      const row: any = app.db.query("SELECT mime FROM contact_photos WHERE email = ?").get("erin@acme.com");
+      expect(row?.mime).toBe("image/jpeg");
+      // and the HTTP endpoint now serves it
+      const hit = await app.fetch(new Request("http://localhost/api/contacts/photo?email=erin@acme.com"));
+      expect(hit.status).toBe(200);
+      rmSync(dir, { recursive: true, force: true });
+    } finally {
+      if (origBin === undefined) delete process.env.CADENCE_ADDRESSBOOK_EXPORT;
+      else process.env.CADENCE_ADDRESSBOOK_EXPORT = origBin;
+      void origScan;
+    }
+  });
+
+  test("sync endpoint reports errors verbosely", async () => {
+    const origBin = process.env.CADENCE_ADDRESSBOOK_EXPORT;
+    process.env.CADENCE_ADDRESSBOOK_EXPORT = "/tmp/definitely-not-here";
+    try {
+      const r = await app.fetch(new Request("http://localhost/api/contacts/photos/sync", { method: "POST" }));
+      const data: any = await r.json();
+      // no sources dir override here; on this machine there are no EDS sources
+      expect(typeof data.books).toBe("number");
+      expect(Array.isArray(data.errors)).toBe(true);
+    } finally {
+      if (origBin === undefined) delete process.env.CADENCE_ADDRESSBOOK_EXPORT;
+      else process.env.CADENCE_ADDRESSBOOK_EXPORT = origBin;
+    }
+  });
+});
