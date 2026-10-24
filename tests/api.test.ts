@@ -211,6 +211,35 @@ describe("mundane activity log", () => {
     const dash = await call("GET", `/api/runs/${mRun}`);
     expect(Array.isArray(dash.data.nudges)).toBe(true);
   });
+
+  test("manual note view/edit round-trip", async () => {
+    const created = await call("POST", `/api/runs/${mRun}/tasks/${tid}/links`, {
+      source: "manual", kind: "note", label: "line one\nline two",
+    });
+    expect(created.status).toBe(201);
+    const linkId = created.data.id;
+    const put = await call("PUT", `/api/links/${linkId}`, { label: "edited note" });
+    expect(put.status).toBe(200);
+    const dash = await call("GET", `/api/runs/${mRun}`);
+    const t = dash.data.weeks[0].roles.CEO[0];
+    expect(t.links.find((l: any) => l.id === linkId).label).toBe("edited note");
+    expect(dash.data.activity.some((a: any) =>
+      a.type === "event" && a.label === `edited note on “${title}”`)).toBe(true);
+  });
+
+  test("note edit validation", async () => {
+    const created = await call("POST", `/api/runs/${mRun}/tasks/${tid}/links`, {
+      source: "manual", kind: "note", label: "keep me",
+    });
+    const linkId = created.data.id;
+    expect((await call("PUT", `/api/links/${linkId}`, { label: "   " })).status).toBe(400);
+    expect((await call("PUT", "/api/links/nope", { label: "x" })).status).toBe(404);
+    // non-manual links aren't editable
+    const th = await call("POST", `/api/runs/${mRun}/tasks/${tid}/links`, {
+      source: "email-imap", kind: "thread", ref: "s", label: "Subj", meta: {},
+    });
+    expect((await call("PUT", `/api/links/${th.data.id}`, { label: "x" })).status).toBe(400);
+  });
 });
 
 describe("connectors", () => {
@@ -1098,6 +1127,116 @@ describe("assign from feed (send endpoint)", () => {
       await call2("POST", "/api/email-accounts", { action: "remove", id });
     });
   });
+});
+
+describe("thread reply", () => {
+  let app4: ReturnType<typeof createApp>;
+  let tmp4: string;
+  let run4 = "", task4 = "", link4 = "";
+  const smtpSent: string[] = [];
+  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+  const smtpMockIO = () => {
+    let reads = 0;
+    let ehloCount = 0;
+    const pending: string[] = [];
+    return {
+      write: (d: string) => { smtpSent.push(d); },
+      readLine: async () => {
+        reads++;
+        if (reads === 1) return "220 smtp.example.com ESMTP";
+        if (pending.length) return pending.shift()!;
+        const last = (smtpSent[smtpSent.length - 1] || "").split("\r\n")[0];
+        if (last === "EHLO cadence.local") {
+          ehloCount++;
+          pending.push(...(ehloCount === 1
+            ? ["250-smtp.example.com", "250 STARTTLS"]
+            : ["250-smtp.example.com", "250-AUTH LOGIN", "250 HELP"]));
+          return pending.shift()!;
+        }
+        if (last === "STARTTLS") return "220 2.0.0 Ready";
+        if (last === "AUTH LOGIN") return "334 VXNlcm5hbWU6";
+        if (/^[A-Za-z0-9+/=]+$/.test(last) && Buffer.from(last, "base64").toString("utf8").includes("@"))
+          return "334 UGFzc3dvcmQ6";
+        if (last === b64("pw")) return "235 2.7.0 ok";
+        if (last.startsWith("MAIL FROM:")) return "250 2.1.0 Ok";
+        if (last.startsWith("RCPT TO:")) return "250 2.1.5 Ok";
+        if (last === "DATA") return "354 End data";
+        if ((smtpSent[smtpSent.length - 1] || "").includes("\r\n.\r\n"))
+          return "250 2.0.0 Ok: queued";
+        if (last === "QUIT") return "221 2.0.0 Bye";
+        throw new Error("mock-smtp: unexpected command: " + last.slice(0, 60));
+      },
+      startTls: async (_h: string) => {},
+      close: () => {},
+    };
+  };
+  const stubMsgs = [
+    { messageId: "aaa", from: "Client <client@acme.com>", date: "2026-10-20",
+      subject: "Kickoff", snippet: "hi", body: "hi there" },
+    { messageId: "bbb", from: "me@example.com", date: "2026-10-21",
+      subject: "Re: Kickoff", snippet: "ack", body: "acknowledged" },
+  ];
+  async function call4(method: string, path: string, body?: any) {
+    const res = await app4.fetch(new Request(`http://localhost${path}`, {
+      method, headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }));
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  }
+
+  beforeAll(async () => {
+    tmp4 = mkdtempSync(join(tmpdir(), "cadence-reply-"));
+    app4 = createApp({
+      dbPath: join(tmp4, "test.db"),
+      smtpIoFactory: async () => smtpMockIO(),
+      threadFetcher: async () => stubMsgs as any,
+    });
+    await call4("POST", "/api/connectors/email-imap", { config: {
+      smtp_host: "smtp.example.com", smtp_port: 587,
+      smtp_user: "me@example.com", smtp_pass: "pw",
+    } });
+    const pb = await call4("GET", "/api/playbooks");
+    const r = await call4("POST", "/api/runs", {
+      playbook_id: pb.data[0].id, name: "Reply run", start_date: today(),
+    });
+    run4 = r.data.id;
+    const dash = await call4("GET", `/api/runs/${run4}`);
+    task4 = dash.data.weeks[0].roles.CEO[0].id;
+    const lk = await call4("POST", `/api/runs/${run4}/tasks/${task4}/links`, {
+      source: "email-imap", kind: "thread", ref: "kickoff", label: "Kickoff",
+      meta: { from: "client@acme.com", last_from: "me@example.com", date: "2026-10-21" },
+    });
+    link4 = lk.data.id;
+  });
+  afterAll(() => { app4.close(); rmSync(tmp4, { recursive: true, force: true }); });
+
+  test("reply sends with threading headers and updates the link", async () => {
+    const r = await call4("POST", "/api/connectors/email-imap/reply", {
+      run_id: run4, task_id: task4, link_id: link4, body: "Sounds good, moving ahead.",
+    });
+    expect(r.status).toBe(201);
+    expect(r.data.to).toBe("client@acme.com"); // latest external sender, not self
+    const raw = smtpSent.join("\n");
+    expect(raw).toContain("In-Reply-To: <bbb>"); // newest message with a real id
+    expect(raw).toContain("References: <aaa> <bbb>");
+    expect(raw).toContain("Subject: Re: Kickoff");
+    const dash = await call4("GET", `/api/runs/${run4}`);
+    const link = dash.data.weeks[0].roles.CEO[0].links.find((l: any) => l.id === link4);
+    expect(link.meta.last_from).toBe("me@example.com");
+    expect(link.meta.count).toBe(1);
+    expect(link.meta.seen_ids).toContain(r.data.message_id);
+    const ev = dash.data.activity.find((a: any) =>
+      a.type === "event" && a.label === `replied to “Kickoff” on “${dash.data.weeks[0].roles.CEO[0].title}”`);
+    expect(ev).toBeDefined();
+  });
+
+  test("reply validation", async () => {
+    const base = { run_id: run4, task_id: task4, link_id: link4 };
+    expect((await call4("POST", "/api/connectors/email-imap/reply", { ...base, body: "   " })).status).toBe(400);
+    expect((await call4("POST", "/api/connectors/email-imap/reply", { ...base, link_id: "nope", body: "x" })).status).toBe(404);
+  });
+});
+
 describe("thread sync (syncThread)", () => {
   const M = (over: any = {}) => ({
     messageId: "m1", from: "jane@acme.com", date: "2026-10-20",
@@ -1261,6 +1400,31 @@ describe("feed sync endpoints", () => {
     expect(ev).toBeDefined();
     expect(ev.label).toContain("1 new reply");
     expect(ev.task_id).toBe(task3);
+  });
+
+  test("thread messages endpoint reads oldest-first", async () => {
+    stubMsgs = [
+      M({ messageId: "m2", date: "2026-10-21", snippet: "second" }),
+      M({ messageId: "m1", date: "2026-10-20", snippet: "first" }),
+    ];
+    const added = await addThread(task3);
+    const r = await call3("GET",
+      `/api/runs/${run3}/tasks/${task3}/threads/${added.data.id}/messages`);
+    expect(r.status).toBe(200);
+    expect(r.data.messages.length).toBe(2);
+    expect(r.data.messages[0].date).toBe("2026-10-20"); // oldest first
+    expect(r.data.messages[0].snippet).toBe("first");
+    expect(r.data.messages[0].messageId).toBeUndefined(); // not exposed
+  });
+
+  test("thread messages 404s for unknown thread / non-thread link", async () => {
+    expect((await call3("GET",
+      `/api/runs/${run3}/tasks/${task3}/threads/nope/messages`)).status).toBe(404);
+    const note = await call3("POST", `/api/runs/${run3}/tasks/${task3}/links`, {
+      source: "manual", kind: "note", label: "x",
+    });
+    expect((await call3("GET",
+      `/api/runs/${run3}/tasks/${task3}/threads/${note.data.id}/messages`)).status).toBe(404);
   });
 
   test("sync-feeds caps at 20 most-recently-active threads", async () => {
@@ -1651,7 +1815,6 @@ describe("contact photo bulk sync", () => {
   });
 });
 
-});
 describe("manual contact photos", () => {
   const jpegB64 = "/9j/4AAQSkZJRg=="; // FF D8 FF E0 — minimal JPEG magic
   const pngB64 = "iVBORw0KGgo=";     // 89 50 4E 47 — minimal PNG magic

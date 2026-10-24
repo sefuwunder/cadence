@@ -8,6 +8,7 @@ import { parseIntent, matchKpiName, matchTask } from "../src/illiad/intents.ts";
 import { kpiPacing, analyzeRun } from "../src/illiad/analyze.ts";
 import { composeBrief, composeEncouragement, daypart } from "../src/illiad/brief.ts";
 import { nudgeList } from "../src/illiad/nudges.ts";
+import { programToday } from "../src/illiad/today.ts";
 
 const KPI_NAMES = ["Outbound Emails/DMs", "Discovery Calls", "SQLs", "Closed Packages", "Active Seats"];
 
@@ -445,5 +446,69 @@ describe("nudgeList", () => {
     const n = nudgeList(
       dashFor({ weeks: [{ week: 1, roles: { CEO: [mk(1), mk(2), mk(3)] } }] }), NOW);
     expect(n.length).toBeLessThanOrEqual(4);
+  });
+});
+
+describe("programToday", () => {
+  const NOW = new Date("2026-10-24T02:00:00Z").getTime(); // 22:00 EDT — evening
+  const dashFor = (over: any = {}) => ({
+    run: { id: "r1", name: "Sprint", start_date: "2026-10-19" },
+    current_week: 1,
+    weeks: [{ week: 1, roles: { CEO: [] as any[] } }],
+    kpis: [],
+    overall: { tasks_done: 0, tasks_total: 0, pct: 0 },
+    ...over,
+  });
+  const task = (over: any = {}) => ({
+    id: "t1", title: "First task", done: false, done_at: null,
+    links: [], unread: false, stalled: false, days_quiet: null, ...over,
+  });
+
+  test("greeting follows the daypart", () => {
+    const p = programToday(dashFor(), NOW);
+    expect(p.greeting).toBe("Good evening");
+  });
+
+  test("stalled task becomes the focus", () => {
+    const t = task({ id: "s1", title: "Quiet one", stalled: true, days_quiet: 6,
+      links: [{ source: "manual", kind: "note", meta: {}, created_at: "2026-10-10T00:00:00Z" }] });
+    const p = programToday(dashFor({ weeks: [{ week: 1, roles: { CEO: [t] } }] }), NOW);
+    expect(p.focus).toBeDefined();
+    expect(p.focus!.task_id).toBe("s1");
+    expect(p.focus!.reason).toContain("Quiet 6d");
+  });
+
+  test("unread thread becomes the focus when nothing is stalled", () => {
+    const t = task({ id: "u1", title: "Thread task", unread: true,
+      links: [{ source: "email-imap", kind: "thread", label: "Re: Terms",
+                meta: { unseen: 2, last_from: "a@b.co" }, created_at: "2026-10-23T10:00:00Z" }] });
+    const p = programToday(dashFor({ weeks: [{ week: 1, roles: { CEO: [t] } }] }), NOW);
+    expect(p.focus!.task_id).toBe("u1");
+    expect(p.focus!.reason).toContain("2 unread");
+  });
+
+  test("otherwise the next open task is the focus", () => {
+    const p = programToday(
+      dashFor({ weeks: [{ week: 1, roles: { CEO: [task({ id: "n1", title: "Next up" })] } }] }), NOW);
+    expect(p.focus!.task_id).toBe("n1");
+    expect(p.focus!.reason).toContain("next move");
+  });
+
+  test("all done → no focus, wins carry the page", () => {
+    const t = task({ id: "d1", title: "Done", done: true, done_at: "2026-10-22T10:00:00Z" });
+    const p = programToday(
+      dashFor({
+        weeks: [{ week: 1, roles: { CEO: [t] } }],
+        overall: { tasks_done: 1, tasks_total: 1, pct: 100 },
+      }), NOW);
+    expect(p.focus).toBeNull();
+    expect(p.wins.length).toBeGreaterThan(0);
+    expect(p.wins[0]).toContain("1 of 1 tasks done");
+  });
+
+  test("line leads with wins, never shames an empty board", () => {
+    const p = programToday(dashFor(), NOW);
+    expect(p.line).toContain("first win is one task away");
+    expect(p.line).not.toContain("0 of 0");
   });
 });

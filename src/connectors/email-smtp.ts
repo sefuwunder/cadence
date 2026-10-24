@@ -235,6 +235,8 @@ export interface OutgoingMessage {
   body: string;
   date?: Date;
   messageId?: string;
+  inReplyTo?: string;    // raw message-id (no brackets) this message answers
+  references?: string[]; // raw message-ids forming the thread chain
 }
 
 /** Build a plain-text RFC 5322 message. Returns the raw bytes + Message-ID. */
@@ -247,12 +249,18 @@ export function buildMessage(m: OutgoingMessage): { raw: string; messageId: stri
     `Subject: ${encodeHeader(m.subject)}`,
     `Date: ${date}`,
     `Message-ID: ${messageId}`,
+  ];
+  if (m.inReplyTo) lines.push(`In-Reply-To: <${m.inReplyTo}>`);
+  if (m.references && m.references.length) {
+    lines.push(`References: ${m.references.map((r) => `<${r}>`).join(" ")}`);
+  }
+  lines.push(
     "MIME-Version: 1.0",
     "Content-Type: text/plain; charset=utf-8",
     "Content-Transfer-Encoding: 8bit",
     "",
     m.body.replace(/\r?\n/g, "\r\n"),
-  ];
+  );
   return { raw: lines.join("\r\n") + "\r\n", messageId };
 }
 
@@ -342,10 +350,13 @@ export async function sendEmail(opts: {
  *  "is SMTP configured?" check from the network send). */
 export async function sendWithConfig(
   cfg: SmtpCfg,
-  msg: { to: string[]; subject: string; body: string },
+  msg: { to: string[]; subject: string; body: string; inReplyTo?: string; references?: string[] },
   ioFactory?: () => Promise<SmtpLineIO>,
 ): Promise<{ messageId: string; from: string; to: string[]; raw: string }> {
-  const { raw, messageId } = buildMessage({ from: cfg.user, to: msg.to, subject: msg.subject, body: msg.body });
+  const { raw, messageId } = buildMessage({
+    from: cfg.user, to: msg.to, subject: msg.subject, body: msg.body,
+    inReplyTo: msg.inReplyTo, references: msg.references,
+  });
   const io = ioFactory ? await ioFactory() : await SocketLineIO.connect(cfg.host, cfg.port, cfg.secure);
   try {
     await new SmtpSession(io).send(cfg, { to: msg.to, raw });

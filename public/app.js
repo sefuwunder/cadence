@@ -190,12 +190,25 @@ function render() {
 document.addEventListener("click", async (e) => {
   const evb = e.target.closest("[data-ev]");
   if (evb) { feedSheet(evb.dataset.ev); return; }
+  const note = e.target.closest("[data-note]");
+  if (note) { noteSheet(note.dataset.ntask, note.dataset.note); return; }
+  const th = e.target.closest("[data-thread]");
+  if (th) { threadSheet(th.dataset.ntask, th.dataset.thread); return; }
   const fm = e.target.closest("[data-foldmore]");
   if (fm) {
     const rest = fm.nextElementSibling;
     const open = rest.hidden;
-    rest.hidden = !open;
-    fm.textContent = open ? "Show less ▴" : `Show all ${rest.children.length + 1} ▾`;
+    if (open) {
+      // Fan out: unhide, then stagger the cards 1 → many.
+      rest.hidden = false;
+      [...rest.children].forEach((c, i) => c.style.setProperty("--i", i));
+      requestAnimationFrame(() => requestAnimationFrame(() => rest.classList.add("fan")));
+      fm.textContent = "Show less ▴";
+    } else {
+      rest.classList.remove("fan");
+      rest.hidden = true;
+      fm.textContent = `Show all ${rest.children.length + 1} ▾`;
+    }
     return;
   }
   const ft = e.target.closest("[data-foldtoggle]");
@@ -243,8 +256,25 @@ function renderToday() {
       for (const t of ts) if (t.stalled) stalled.push({ ...t, week: w.week, role });
   }
   stalled.sort((a, b) => (b.days_quiet || 0) - (a.days_quiet || 0));
+  // Illiad programs the page: greeting, wins-first state of play, one focus.
+  const tp = d.today || null;
+  const programCard = tp ? `
+    <div class="card today-program">
+      <div class="nudge-head"><span class="brand-mark">✦</span> ${esc(tp.greeting)} — here's your cadence</div>
+      <div class="today-line">${esc(tp.line)}</div>
+      ${tp.focus ? `
+      <div class="focus-card" data-ev="${esc(tp.focus.task_id)}" role="button" tabindex="0"
+           aria-label="Today's focus: ${esc(tp.focus.title)} — open feed">
+        <div class="focus-label">Today's focus</div>
+        <div class="focus-title">${esc(tp.focus.title)}</div>
+        <div class="focus-reason">${esc(tp.focus.reason)}</div>
+      </div>` : ""}
+      ${tp.wins.length ? `<div class="win-chips">${tp.wins.map((w) =>
+        `<span class="win-chip">✓ ${esc(w)}</span>`).join("")}</div>` : ""}
+    </div>` : "";
   $("#view-today").innerHTML = `
     <h2>Today</h2>
+    ${programCard}
     <p class="sub">Week ${wk.week} of ${d.weeks.length} · ${esc(wk.theme)} · ${wk.tasks_done}/${wk.tasks_total} tasks</p>
     <div class="bar" style="margin-bottom:16px"><i style="width:${wk.tasks_total ? Math.round(100 * wk.tasks_done / wk.tasks_total) : 0}%"></i></div>
     ${stalled.length ? `
@@ -740,12 +770,19 @@ function metaLine(l) {
   return bits.join(" · ");
 }
 
-function linkRow(l) {
+function linkRow(l, taskId) {
   const av = (l.source === "email-imap" && (l.kind === "thread" || l.kind === "message"))
     ? threadAvatars(l) : "";
+  // Manual notes open a full view with editing; email threads open a
+  // message view with reply. The Remove button is outside the tap target.
+  const tap = l.source === "manual" && l.kind === "note"
+    ? ` data-note="${esc(l.id)}" data-ntask="${esc(taskId || "")}"`
+    : l.source === "email-imap" && l.kind === "thread"
+      ? ` data-thread="${esc(l.id)}" data-ntask="${esc(taskId || "")}"`
+      : "";
   return `<div class="link-row">
     ${av}${srcBadge(l.source)}
-    <div class="link-body"><b>${esc(l.label)}</b><div class="meta">${esc(metaLine(l))}</div></div>
+    <div class="link-body${tap ? " tappable" : ""}"${tap}><b>${esc(l.label)}</b><div class="meta">${esc(metaLine(l))}</div></div>
     <button class="btn ghost small" data-unlink="${esc(l.id)}">Remove</button>
   </div>`;
 }
@@ -815,7 +852,7 @@ async function feedSheet(taskId) {
       </div>
     </div>
     <p class="meta" style="color:var(--muted);font-size:13px;margin:6px 0 12px">${esc(task.title)}</p>
-    <div id="ev-list">${links.map(linkRow).join("") || `<div class="meta">Nothing in the feed yet.</div>`}</div>
+    <div id="ev-list">${links.map((l) => linkRow(l, taskId)).join("") || `<div class="meta">Nothing in the feed yet.</div>`}</div>
     <button class="fold-toggle" id="f-addtoggle" data-foldtoggle="f-addbody" aria-expanded="false">
       <span>Add to feed</span><span class="fold-arrow">▸</span>
     </button>
@@ -876,6 +913,107 @@ async function removeFromFeed(taskId, linkId) {
     await loadDash();
     feedSheet(taskId);
   } catch (e) { alert(e.message); }
+}
+
+function feedLink(taskId, linkId) {
+  const task = findTask(taskId);
+  const link = task && (task.links || []).find((l) => l.id === linkId);
+  return { task, link };
+}
+
+/* ---------- manual notes: view + edit ---------- */
+function noteSheet(taskId, linkId) {
+  const { task, link } = feedLink(taskId, linkId);
+  if (!task || !link) return;
+  openSheet(`
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <button class="btn ghost small" id="n-back">‹ Back</button>
+      <h3 style="margin:0">Note</h3>
+    </div>
+    <p class="meta" style="color:var(--muted);font-size:13px;margin:6px 0 12px">${esc(task.title)}</p>
+    <div class="note-body">${esc(link.label).replace(/\n/g, "<br>")}</div>
+    <div class="sheet-actions">
+      <button class="btn ghost" id="n-edit">Edit</button>
+    </div>`);
+  $("#n-back").onclick = () => feedSheet(taskId);
+  $("#n-edit").onclick = () => noteEditSheet(taskId, linkId);
+}
+
+function noteEditSheet(taskId, linkId) {
+  const { task, link } = feedLink(taskId, linkId);
+  if (!task || !link) return;
+  openSheet(`
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <button class="btn ghost small" id="n-back">‹ Back</button>
+      <h3 style="margin:0">Edit note</h3>
+    </div>
+    <p class="meta" style="color:var(--muted);font-size:13px;margin:6px 0 12px">${esc(task.title)}</p>
+    <div class="field"><label>Note</label>
+      <textarea id="n-text" rows="6">${esc(link.label)}</textarea></div>
+    <div class="sheet-actions">
+      <button class="btn ghost" id="n-cancel">Cancel</button>
+      <button class="btn" id="n-save">Save</button>
+    </div>`);
+  $("#n-back").onclick = () => noteSheet(taskId, linkId);
+  $("#n-cancel").onclick = () => noteSheet(taskId, linkId);
+  $("#n-save").onclick = async () => {
+    const v = $("#n-text").value.trim();
+    if (!v) { alert("Note can't be empty"); return; }
+    const btn = $("#n-save");
+    btn.disabled = true; btn.textContent = "Saving…";
+    try {
+      await api(`/api/links/${linkId}`, "PUT", { label: v });
+      await loadDash();
+      noteSheet(taskId, linkId);
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false; btn.textContent = "Save";
+    }
+  };
+}
+
+/* ---------- email threads: view messages + reply ---------- */
+async function threadSheet(taskId, linkId) {
+  const { task, link } = feedLink(taskId, linkId);
+  if (!task || !link) return;
+  openSheet(`
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <button class="btn ghost small" id="t-back">‹ Back</button>
+      <h3 style="margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(link.label)}</h3>
+    </div>
+    <div id="t-msgs" style="margin-top:8px"><div class="meta" style="color:var(--muted)">Loading thread…</div></div>
+    <div class="field" style="margin-top:12px"><label>Reply</label>
+      <textarea id="t-reply" rows="3" placeholder="Write a reply…"></textarea></div>
+    <div class="sheet-actions"><button class="btn" id="t-send">Send reply</button></div>`);
+  $("#t-back").onclick = () => feedSheet(taskId);
+  try {
+    const r = await api(`/api/runs/${state.runId}/tasks/${taskId}/threads/${linkId}/messages`);
+    const msgs = r.messages || [];
+    $("#t-msgs").innerHTML = msgs.length ? msgs.map((m) => {
+      const { name, email } = addrParts(m.from);
+      return `<div class="msg-card">
+        <div class="msg-head"><b>${esc(name || email || m.from)}</b><span class="meta">${esc(m.date)}</span></div>
+        <div class="msg-body">${esc(m.body || m.snippet || "").replace(/\n/g, "<br>")}</div>
+      </div>`;
+    }).join("") : `<div class="meta" style="color:var(--muted)">No messages found.</div>`;
+  } catch (e) {
+    $("#t-msgs").innerHTML = `<div class="meta" style="color:var(--muted)">${esc(e.message)}</div>`;
+  }
+  $("#t-send").onclick = async () => {
+    const v = $("#t-reply").value.trim();
+    if (!v) { alert("Write a reply first"); return; }
+    const btn = $("#t-send");
+    btn.disabled = true; btn.textContent = "Sending…";
+    try {
+      await api("/api/connectors/email-imap/reply", "POST",
+        { run_id: state.runId, task_id: taskId, link_id: linkId, body: v });
+      await loadDash();
+      threadSheet(taskId, linkId);
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false; btn.textContent = "Send reply";
+    }
+  };
 }
 
 async function addToFeed(taskId, payload) {

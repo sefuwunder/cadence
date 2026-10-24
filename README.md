@@ -24,13 +24,21 @@ Hit **+** in the top bar to start a run from it.
 
 ## Tabs
 
-- **Today** — this week's tasks grouped by role, checkboxes; KPI glance for the week.
+- **Today** — Illiad programs the page to keep the cadence: a greeting, a
+  wins-first state of play, one **Today's focus** (the single highest-leverage
+  move — quietest stalled task, then most-unread thread, then the next open
+  task), and win chips — so the page always reads as hope and progression.
+  This week's tasks grouped by role, checkboxes; KPI glance for the week.
   A **Needs attention** section tops the view with stalled tasks (no feed activity
-  in 3+ days, current/past weeks only).
+  in 3+ days, current/past weeks only). Folded sections fan out 1 → many with
+  a staggered animation.
 - **Playbook** — week selector (W1–W4), role swimlanes with completion counts.
 - **KPIs** — cards with per-week target/actual bars, manual log, per-connector sync,
   and a Connectors section for setup.
-- **Activity** — feed: task completions + metric entries with source badges.
+- **Activity** — everything happening across the run: task completions, metric
+  entries, and mundane events (manual notes, thread links, sends, toggles, KPI
+  logs, syncs, webhook pushes — source-badged), topped by **Nudges from
+  Illiad** (stalled / pacing / unread / momentum, tap-through to the task feed).
 - **People** — stakeholder rollup: every counterparty across the run's email
   threads, expandable to their threads (tap to open that task's feed) and tasks.
   Avatars prefer the contact's real photo (synced from the system address book;
@@ -43,6 +51,15 @@ Hit **+** in the top bar to start a run from it.
 Any source of truth can be mapped to an individual playbook task: tap the 🔗 on a
 task row to open its feed — linked items (email threads, manual notes,
 webhook records) with source badges, plus unlink buttons.
+
+- **Manual notes** — tap a note to read it in full; **Edit** updates the text
+  (`PUT /api/links/:id`, user-authored notes only).
+- **Email threads** — tap a thread to read its messages (oldest first) and
+  **reply in-thread**: the reply goes to the latest external sender with
+  `In-Reply-To`/`References` threading headers, is filed to Sent, and folds
+  into the link's meta (so the next sync doesn't count your own reply as new).
+  `GET /api/runs/:runId/tasks/:taskId/threads/:linkId/messages`,
+  `POST /api/connectors/email-imap/reply` (always user-initiated, never auto-sent).
 
 - **Email threads** — search your mail by subject/from/text; results are grouped
   into threads by normalized subject (Re:/Fwd:/[tags] stripped, case-insensitive —

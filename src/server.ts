@@ -8,12 +8,13 @@ import { readFileSync, existsSync, mkdirSync } from "fs";
 import { initDb, seedIfEmpty } from "./db.ts";
 import { getConnector, connectors } from "./connectors/index.ts";
 import { keyIsValid } from "./connectors/webhook.ts";
-import { searchThreads, appendToSent, normalizeSubject, syncThread, type ThreadMessage } from "./connectors/email-imap.ts";
+import { searchThreads, appendToSent, normalizeSubject, syncThread, getThreadMessages, type ThreadMessage } from "./connectors/email-imap.ts";
 import { sendWithConfig, type SmtpLineIO } from "./connectors/email-smtp.ts";
 import { resolveCalConfig, parseIcs, fetchIcs, filterEvents } from "./connectors/calendar-ical.ts";
 import { listGoaMailAccounts } from "./goa.ts";
 import { askIlliad } from "./illiad/ask.ts";
 import { nudgeList } from "./illiad/nudges.ts";
+import { programToday } from "./illiad/today.ts";
 import { getContactPhoto, syncPhotosFromEDS, saveManualPhoto, deleteContactPhoto } from "./contacts.ts";
 import { listSendAccounts, resolveSmtpForAccount, imapConfigForAccount, readImapConfig, writeImapConfig, ownEmails } from "./mail-accounts.ts";
 
@@ -359,6 +360,8 @@ export function getDashboard(db: Database, runId: string): any | null {
   };
   // Illiad behavior nudges — derived from the same payload, never stored.
   dash.nudges = nudgeList(dash);
+  // Illiad programs the Today page: greeting, wins-first line, one focus.
+  dash.today = programToday(dash);
   return dash;
 }
 
@@ -392,6 +395,18 @@ export function createApp(opts: {
     // harvested as contacts, never shown as stakeholders.
     let ownCache: Set<string> | null = null;
     const ownAddrs = async (): Promise<Set<string>> => (ownCache ??= await ownEmails(db));
+
+    // Thread messages for viewing and reply-threading: the injectable stub
+    // in tests, real IMAP otherwise. Always oldest-first.
+    const fetchThreadMsgs = async (subject: string, config: any): Promise<ThreadMessage[]> => {
+      if (opts.threadFetcher) {
+        const msgs = await opts.threadFetcher(subject);
+        return msgs
+          .map((m: any) => ({ ...m, body: m.body || m.snippet || "" }))
+          .sort((a: any, b: any) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+      }
+      return getThreadMessages(subject, config);
+    };
 
     try {
       // ----- playbooks -----
@@ -529,7 +544,7 @@ export function createApp(opts: {
         const id = uuid();
         db.run(
           "INSERT INTO task_links (id, task_id, source, kind, ref, label, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-          [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 500),
+          [id, taskId, source, kind, String(b?.ref || "").slice(0, 200), label.slice(0, 2000),
            JSON.stringify(meta), new Date().toISOString()]);
         // Mundane activity: what was added, and to which task.
         const feedLabel =
@@ -551,6 +566,22 @@ export function createApp(opts: {
       if (pm && m === "DELETE") {
         db.run("DELETE FROM task_links WHERE id = ?", [decodeURIComponent(pm[1])]);
         return new Response(null, { status: 204 });
+      }
+      // Edit a manual note's text. Only user-authored notes are editable —
+      // thread/event labels are derived from their source.
+      if (pm && m === "PUT") {
+        const linkId = decodeURIComponent(pm[1]);
+        const l: any = db.query(
+          "SELECT tl.*, t.run_id, t.title AS task_title FROM task_links tl " +
+          "JOIN tasks t ON t.id = tl.task_id WHERE tl.id = ?").get(linkId);
+        if (!l) return err(404, "link not found");
+        if (l.source !== "manual") return err(400, "only manual notes can be edited");
+        const b = await body(req);
+        const label = String(b?.label || "").trim();
+        if (!label) return err(400, "label is required");
+        db.run("UPDATE task_links SET label = ? WHERE id = ?", [label.slice(0, 2000), linkId]);
+        logEvent(db, l.run_id, "feed", `edited note on “${l.task_title}”`, { task_id: l.task_id, link_id: linkId });
+        return json({ ok: true });
       }
 
       // ----- inbound thread sync -----
@@ -617,6 +648,31 @@ export function createApp(opts: {
           }
         })();
         return json({ ok: true });
+      }
+      // Read a linked thread's messages (oldest first). Read-only IMAP.
+      pm = path.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/threads\/([^/]+)\/messages$/);
+      if (pm && m === "GET") {
+        const [runId, taskId, linkId] =
+          [decodeURIComponent(pm[1]), decodeURIComponent(pm[2]), decodeURIComponent(pm[3])];
+        const l: any = db.query(
+          "SELECT tl.* FROM task_links tl JOIN tasks t ON t.id = tl.task_id " +
+          "WHERE tl.id = ? AND tl.task_id = ? AND t.run_id = ? " +
+          "AND tl.source = 'email-imap' AND tl.kind = 'thread'").get(linkId, taskId, runId);
+        if (!l) return err(404, "thread not found");
+        const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
+        const config = row ? JSON.parse(row.config_json) : {};
+        try {
+          const messages = await fetchThreadMsgs(l.label || l.ref, config);
+          return json({
+            messages: messages.map((mg) => ({
+              from: mg.from, date: mg.date, subject: mg.subject,
+              snippet: mg.snippet, body: mg.body,
+            })),
+          });
+        } catch (e: any) {
+          const msg = e?.message || "thread fetch failed";
+          return err(/missing IMAP credentials/.test(msg) ? 400 : 502, msg);
+        }
       }
 
       // ----- stakeholders -----
@@ -746,6 +802,76 @@ export function createApp(opts: {
         logEvent(db, String(b.run_id), "feed", `sent email to ${toShort} from “${t.title}”`,
           { task_id: b.task_id, link_id: linkId });
         return json({ link_id: linkId, message_id: sent.messageId, from: sent.from }, 201);
+      }
+      // Reply inside a linked thread. Always user-initiated from the thread
+      // view — never auto-sent. Threading headers keep it in the same
+      // conversation; the reply is filed to Sent and folded into the link's
+      // meta so the next sync doesn't count our own message as new.
+      pm = path.match(/^\/api\/connectors\/email-imap\/reply$/);
+      if (pm && m === "POST") {
+        const b = await body(req);
+        const linkId = String(b?.link_id || "");
+        const msgBody = String(b?.body || "").trim();
+        if (!msgBody) return err(400, "body is required");
+        const l: any = db.query(
+          "SELECT tl.*, t.run_id, t.title AS task_title FROM task_links tl " +
+          "JOIN tasks t ON t.id = tl.task_id " +
+          "WHERE tl.id = ? AND tl.task_id = ? AND t.run_id = ? " +
+          "AND tl.source = 'email-imap' AND tl.kind = 'thread'")
+          .get(linkId, b?.task_id, b?.run_id);
+        if (!l) return err(404, "thread not found");
+        const meta = JSON.parse(l.meta_json || "{}");
+        const row: any = db.query("SELECT config_json FROM connector_cfg WHERE id = 'email-imap'").get();
+        const config = row ? JSON.parse(row.config_json) : {};
+        let resolved;
+        try {
+          resolved = await resolveSmtpForAccount(db, String(b?.from_account || ""));
+        } catch (e: any) {
+          return err(400, e?.message || "SMTP is not configured");
+        }
+        const own = await ownAddrs();
+        // Reply to the latest external sender; fall back to the thread's from.
+        const candidates = [meta.last_from, meta.from].map((s: any) => parseAddr(s)?.email).filter(Boolean);
+        const toAddr = candidates.find((e: string) => !own.has(e));
+        if (!toAddr) return err(400, "no one to reply to in this thread");
+        // Threading headers from a fresh fetch (newest message with a real id).
+        let inReplyTo = "", references: string[] = [];
+        try {
+          const msgs = await fetchThreadMsgs(l.label || l.ref, config);
+          const ids = msgs.map((mg: any) => {
+            const raw = String(mg.messageId || "");
+            return raw && !raw.startsWith("~") ? raw.replace(/^<|>$/g, "") : "";
+          }).filter(Boolean);
+          if (ids.length) {
+            inReplyTo = ids[ids.length - 1];
+            references = ids.slice(-5);
+          }
+        } catch { /* threading headers are best-effort; the reply still sends */ }
+        const subject = /^re:/i.test(l.label || "") ? l.label : `Re: ${l.label}`;
+        let sent;
+        try {
+          sent = await sendWithConfig(resolved.cfg,
+            { to: [toAddr], subject, body: msgBody, inReplyTo: inReplyTo || undefined,
+              references: references.length ? references : undefined },
+            opts.smtpIoFactory);
+        } catch (e: any) {
+          return err(502, e?.message || "send failed");
+        }
+        try {
+          await appendToSent({ config: imapConfigForAccount(db, resolved.account), raw: sent.raw });
+        } catch (e: any) {
+          console.error("[cadence] sent-mail APPEND failed:", e?.message || e);
+        }
+        const now = new Date().toISOString();
+        const seen: string[] = Array.isArray(meta.seen_ids) ? meta.seen_ids : [];
+        if (sent.messageId && !seen.includes(sent.messageId)) seen.push(sent.messageId);
+        db.run("UPDATE task_links SET meta_json = ? WHERE id = ?", [JSON.stringify({
+          ...meta, seen_ids: seen, count: (Number(meta.count) || 0) + 1,
+          last_from: sent.from, last_date: now.slice(0, 10),
+        }), l.id]);
+        logEvent(db, l.run_id, "feed", `replied to “${l.label}” on “${l.task_title}”`,
+          { task_id: l.task_id, link_id: l.id });
+        return json({ message_id: sent.messageId, to: toAddr }, 201);
       }
       // Recent email contacts for the Assign-from-feed datalist.
       if (path === "/api/email-contacts" && m === "GET") {

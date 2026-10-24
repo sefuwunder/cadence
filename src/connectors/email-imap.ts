@@ -212,6 +212,7 @@ export interface ThreadMessage {
   date: string;      // YYYY-MM-DD (INTERNALDATE)
   subject: string;
   snippet: string;   // first ~140 chars of body text, tags stripped
+  body: string;      // fuller body text (~2000 chars), tags stripped — for thread viewing
 }
 
 export interface ThreadSyncResult {
@@ -301,12 +302,14 @@ function parseThreadFetch(lines: string[]): ThreadMessage[] {
       else { take(); acc = hl.trim(); }
     }
     take();
+    const bodyText = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
     out.push({
       messageId: decodeHeader(headers["message-id"] || "").replace(/^<|>$/g, "").trim(),
       from: decodeHeader(headers["from"] || ""),
       date: cur.date,
       subject: decodeHeader(headers["subject"] || ""),
-      snippet: body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 140),
+      snippet: bodyText.slice(0, 140),
+      body: bodyText.slice(0, 2000),
     });
     cur = null;
   };
@@ -353,7 +356,7 @@ async function imapFetchThreadMessages(subject: string, config: any): Promise<Th
       for (let i = 0; i < uids.length; i += 100) {
         const chunk = uids.slice(i, i + 100);
         const fl = await conn.cmd(`${tag}c`,
-          `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (MESSAGE-ID FROM DATE SUBJECT)] BODY[TEXT]<0.500>)`);
+          `UID FETCH ${chunk.join(",")} (INTERNALDATE BODY[HEADER.FIELDS (MESSAGE-ID FROM DATE SUBJECT)] BODY[TEXT]<0.2000>)`);
         for (const m of parseThreadFetch(fl)) {
           const k = msgKey(m);
           if (!byKey.has(k)) byKey.set(k, m);
@@ -365,6 +368,13 @@ async function imapFetchThreadMessages(subject: string, config: any): Promise<Th
   } finally {
     conn.close();
   }
+}
+
+/** Fetch a thread's messages for viewing (oldest first). Read-only.
+ *  Exported for the thread-view endpoint; syncThread stays the diff engine. */
+export async function getThreadMessages(subject: string, config: any): Promise<ThreadMessage[]> {
+  const msgs = await imapFetchThreadMessages(subject, config);
+  return msgs.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
 class Conn {

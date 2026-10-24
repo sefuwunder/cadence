@@ -158,6 +158,17 @@ select { max-width: 46vw; }
   font: inherit; font-size: 13.5px; cursor: pointer; min-height: 44px;
 }
 .fold-more:active { transform: scale(0.99); }
+/* fan-out: folded cards deal out 1 → many with a stagger */
+@media (prefers-reduced-motion: no-preference) {
+  .fold-rest.fan > * {
+    animation: fanIn 0.45s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+}
+@keyframes fanIn {
+  from { opacity: 0; transform: translateY(-18px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
 .fold-toggle {
   display: flex; align-items: center; justify-content: space-between; width: 100%;
   background: none; border: 0; color: var(--text); font: inherit; font-size: 16px;
@@ -263,6 +274,41 @@ select { max-width: 46vw; }
 }
 .nudge-row.tappable { cursor: pointer; }
 .nudge-row.tappable:active { opacity: 0.7; }
+
+/* ---------- today, programmed by illiad ---------- */
+.today-program { border-color: var(--gold-dim); }
+.today-line { font-size: 15px; margin: 6px 0 12px; line-height: 1.5; }
+.focus-card {
+  background: var(--gold-dim); border: 1px solid var(--gold);
+  border-radius: 12px; padding: 13px 14px; margin-bottom: 12px; cursor: pointer;
+}
+.focus-card:active { transform: scale(0.99); }
+.focus-label {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--gold); margin-bottom: 4px;
+}
+.focus-title { font-size: 16px; font-weight: 700; }
+.focus-reason { font-size: 13.5px; color: var(--muted); margin-top: 4px; }
+.win-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.win-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 13px; font-weight: 600; color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  border-radius: 99px; padding: 5px 12px;
+}
+
+/* ---------- notes & thread view ---------- */
+.link-body.tappable { cursor: pointer; }
+.note-body {
+  background: var(--ink-3); border-radius: 12px; padding: 14px 15px;
+  font-size: 15px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: break-word;
+}
+.msg-card {
+  background: var(--ink-3); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px;
+}
+.msg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.msg-head .meta { color: var(--faint); font-size: 12px; white-space: nowrap; }
+.msg-body { font-size: 14.5px; line-height: 1.55; overflow-wrap: break-word; color: var(--text); }
 
 /* ---------- week pills ---------- */
 .pills { display: flex; gap: 8px; margin-bottom: 16px; overflow-x: auto; padding-bottom: 4px; }
