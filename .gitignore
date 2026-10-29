@@ -2,3 +2,4 @@ data/*.db
 data/*.db-*
 data/imap.json
 node_modules/
+data/staging/
